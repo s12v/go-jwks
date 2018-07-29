@@ -23,6 +23,18 @@
   revision = "a49355c7e3f8fe157a85be2f77e6e269a0f89602"
 
 [[projects]]
+  branch = "master"
+  name = "golang.org/x/net"
+  packages = ["context"]
+  revision = "c4299a1a0d8524c11563db160fbf9bddbceadb21"
+
+[[projects]]
+  branch = "master"
+  name = "golang.org/x/sync"
+  packages = ["semaphore"]
+  revision = "1d60e4601c6fd243af51cc01ddf169918a5407ca"
+
+[[projects]]
   name = "gopkg.in/square/go-jose.v2"
   packages = [
     "cipher",
@@ -34,6 +46,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "0bac447779fd9861758f94a64dcad723f9fd3fb23454177cbb5459f6c91b78db"
+  inputs-digest = "4758ac8f902459ec1a3762c604684480bfc6fc4c4b35673d977528dddeb5c9d5"
   solver-name = "gps-cdcl"
   solver-version = 1

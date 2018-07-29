@@ -3,11 +3,13 @@ package jwks
 import (
 	"github.com/patrickmn/go-cache"
 	"time"
+	"fmt"
 )
 
 type Cache interface {
-	// Get an item from the cache. Returns the item or nil, and a bool indicating whether the key was found
-	Get(k string) (interface{}, bool)
+	// Get an item from the cache and itsexpiration time.
+	// Returns the item or nil, and a bool indicating whether the key was found
+	GetWithExpiration(k string) (interface{}, time.Time, bool)
 	// Add an item to the cache, replacing any existing item.
 	Set(k string, x interface{})
 }
@@ -20,12 +22,15 @@ func (c *defaultCache) Set(k string, x interface{}) {
 	c.cache.Set(k, x, cache.DefaultExpiration)
 }
 
-func (c *defaultCache) Get(k string) (interface{}, bool) {
-	return c.cache.Get(k) // TODO GetWithExpiration and prefetch
+func (c *defaultCache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
+	return c.cache.GetWithExpiration(k)
 }
 
 func DefaultCache(ttl time.Duration) Cache {
+	if ttl < -1 {
+		panic(fmt.Sprintf("invalid ttl: %d", ttl))
+	}
 	return &defaultCache{
-		cache.New(ttl, cache.NoExpiration),
+		cache.New(ttl, -1),
 	}
 }

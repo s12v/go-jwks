@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/square/go-jose"
 	"net/http"
+	"log"
 )
 
 type JWKSSource interface {
@@ -24,6 +25,7 @@ func NewWebSource(jwksUri string) *WebSource {
 }
 
 func (s *WebSource) JSONWebKeySet() (*jose.JSONWebKeySet, error) {
+	log.Printf("Fetchng JWKS from %s", s.jwksUri)
 	resp, err := s.client.Get(s.jwksUri)
 	if err != nil {
 		return nil, err
