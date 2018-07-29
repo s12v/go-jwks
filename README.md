@@ -1,6 +1,5 @@
 [![Build Status](https://travis-ci.com/s12v/go-jwks.svg?branch=master)](https://travis-ci.com/s12v/go-jwks)
 [![codecov](https://codecov.io/gh/s12v/go-jwks/branch/master/graph/badge.svg)](https://codecov.io/gh/s12v/go-jwks)
-
 # go-jwks
 
 A Go library to retrieve RSA public keys from a JWKS (JSON Web Key Set) endpoint.
