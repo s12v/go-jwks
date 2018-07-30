@@ -48,3 +48,20 @@ func TestDefaultCache_GetWithExpiration_Expired(t *testing.T) {
 		t.Fatalf("val should be nil, got %v instead", val)
 	}
 }
+
+func TestDefaultCache(t *testing.T) {
+	DefaultCache(time.Hour)
+	DefaultCache(0)
+	DefaultCache(-1)
+}
+
+func TestDefaultCache_InvalidTtl(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("expected a panic")
+		}
+	}()
+	DefaultCache(-2)
+}
+
+
