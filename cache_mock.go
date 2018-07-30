@@ -3,12 +3,7 @@ package jwks
 import "time"
 
 type mockCache struct {
-	m map[string]pair
-}
-
-type pair struct {
-	val interface{}
-	exp time.Time
+	m map[string]interface{}
 }
 
 func (c *mockCache) Set(k string, x interface{}) {
@@ -16,17 +11,14 @@ func (c *mockCache) Set(k string, x interface{}) {
 }
 
 func (c *mockCache) SetWithExpiration(k string, x interface{}, exp time.Time) {
-	c.m[k] = pair {
-		val: x,
-		exp: exp,
-	}
+	c.m[k] = x
 }
 
-func (c *mockCache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
+func (c *mockCache) Get(k string) (interface{}, bool) {
 	v, exists := c.m[k]
-	return v.val, v.exp, exists
+	return v, exists
 }
 
 func NewMockCache() *mockCache {
-	return &mockCache{make(map[string]pair)}
+	return &mockCache{make(map[string]interface{})}
 }

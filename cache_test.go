@@ -6,17 +6,13 @@ import (
 	"time"
 )
 
-func TestDefaultCache_GetWithExpiration(t *testing.T) {
+func TestDefaultCache_Get(t *testing.T) {
 	c := &defaultCache{
 		cache.New(time.Minute, 0),
 	}
 
 	c.Set("key", "val")
-	val, expTime, found := c.GetWithExpiration("key")
-
-	if expTime.Before(time.Now()) {
-		t.Fatalf("expTime should be after now: %v", expTime)
-	}
+	val, found := c.Get("key")
 
 	if !found {
 		t.Fatal("should be found")
@@ -24,28 +20,6 @@ func TestDefaultCache_GetWithExpiration(t *testing.T) {
 
 	if val != "val" {
 		t.Fatalf("val should be 'val', got %v instead", val)
-	}
-}
-
-func TestDefaultCache_GetWithExpiration_Expired(t *testing.T) {
-	c := &defaultCache{
-		cache.New(time.Nanosecond, 0),
-	}
-
-	c.Set("key", "val")
-	time.Sleep(10 * time.Millisecond)
-	val, expTime, found := c.GetWithExpiration("key")
-
-	if expTime.After(time.Now()) {
-		t.Fatalf("expTime should be before now: %v", expTime)
-	}
-
-	if found {
-		t.Fatal("should be not found")
-	}
-
-	if val != nil {
-		t.Fatalf("val should be nil, got %v instead", val)
 	}
 }
 
@@ -63,5 +37,3 @@ func TestDefaultCache_InvalidTtl(t *testing.T) {
 	}()
 	DefaultCache(-2)
 }
-
-

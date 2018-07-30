@@ -14,26 +14,34 @@ type JWKSClient interface {
 }
 
 type jWKSClient struct {
-	source   JWKSSource
-	cache    Cache
-	prefetch time.Duration
-	sem      *semaphore.Weighted
+	source  JWKSSource
+	cache   Cache
+	refresh time.Duration
+	sem     *semaphore.Weighted
+}
+
+type cacheEntry struct {
+	jwk     *jose.JSONWebKey
+	refresh int64
 }
 
 // Creates a new client with default cache implementation
-func NewDefaultClient(source JWKSSource, ttl time.Duration, prefetch time.Duration) JWKSClient {
-	if prefetch >= ttl {
-		panic(fmt.Sprintf("invalid prefetch: %v greater or eaquals to ttl: %v", prefetch, ttl))
+func NewDefaultClient(source JWKSSource, refresh time.Duration, ttl time.Duration) JWKSClient {
+	if refresh >= ttl {
+		panic(fmt.Sprintf("invalid refresh: %v greater or eaquals to ttl: %v", refresh, ttl))
 	}
-	return NewClient(source, DefaultCache(ttl), prefetch)
+	if refresh < 0 {
+		panic(fmt.Sprintf("invalid refresh: %v", refresh))
+	}
+	return NewClient(source, DefaultCache(ttl), refresh)
 }
 
-func NewClient(source JWKSSource, cache Cache, prefetch time.Duration) JWKSClient {
+func NewClient(source JWKSSource, cache Cache, refresh time.Duration) JWKSClient {
 	return &jWKSClient{
-		source:   source,
-		cache:    cache,
-		prefetch: prefetch,
-		sem:      semaphore.NewWeighted(1),
+		source:  source,
+		cache:   cache,
+		refresh: refresh,
+		sem:     semaphore.NewWeighted(1),
 	}
 }
 
@@ -45,25 +53,22 @@ func (c *jWKSClient) GetEncryptionKey(keyId string) (*jose.JSONWebKey, error) {
 	return c.GetKey(keyId, "enc")
 }
 
-func (c *jWKSClient) GetKey(keyId string, use string) (*jose.JSONWebKey, error) {
-	jwk, expiration, found := c.cache.GetWithExpiration(keyId)
-	if ! found {
-		var err error
-		if jwk, err = c.refreshKey(keyId, use); err != nil {
-			return nil, err
+func (c *jWKSClient) GetKey(keyId string, use string) (jwk *jose.JSONWebKey, err error) {
+	val, found := c.cache.Get(keyId)
+	if found {
+		entry := val.(*cacheEntry)
+		if time.Now().After(time.Unix(entry.refresh, 0)) {
+			if c.sem.TryAcquire(1) {
+				go func() {
+					defer c.sem.Release(1)
+					c.refreshKey(keyId, use)
+				}()
+			}
 		}
+		return entry.jwk, nil
+	} else {
+		return c.refreshKey(keyId, use)
 	}
-
-	if time.Until(expiration) <= c.prefetch {
-		if c.sem.TryAcquire(1) {
-			go func () {
-				defer c.sem.Release(1)
-				c.refreshKey(keyId, use)
-			}()
-		}
-	}
-
-	return jwk.(*jose.JSONWebKey), nil
 }
 
 func (c *jWKSClient) refreshKey(keyId string, use string) (*jose.JSONWebKey, error) {
@@ -72,8 +77,15 @@ func (c *jWKSClient) refreshKey(keyId string, use string) (*jose.JSONWebKey, err
 		return nil, err
 	}
 
-	c.cache.Set(keyId, jwk)
+	c.save(keyId, jwk)
 	return jwk, nil
+}
+
+func (c *jWKSClient) save(keyId string, jwk *jose.JSONWebKey) {
+	c.cache.Set(keyId, &cacheEntry{
+		jwk:     jwk,
+		refresh: time.Now().Add(c.refresh).Unix(),
+	})
 }
 
 func (c *jWKSClient) fetchJSONWebKey(keyId string, use string) (*jose.JSONWebKey, error) {

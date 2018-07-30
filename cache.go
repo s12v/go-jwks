@@ -7,9 +7,9 @@ import (
 )
 
 type Cache interface {
-	// Get an item from the cache and itsexpiration time.
+	// Get an item from the cache
 	// Returns the item or nil, and a bool indicating whether the key was found
-	GetWithExpiration(k string) (interface{}, time.Time, bool)
+	Get(k string) (interface{}, bool)
 	// Add an item to the cache, replacing any existing item.
 	Set(k string, x interface{})
 }
@@ -22,8 +22,8 @@ func (c *defaultCache) Set(k string, x interface{}) {
 	c.cache.Set(k, x, cache.DefaultExpiration)
 }
 
-func (c *defaultCache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
-	return c.cache.GetWithExpiration(k)
+func (c *defaultCache) Get(k string) (interface{}, bool) {
+	return c.cache.Get(k)
 }
 
 func DefaultCache(ttl time.Duration) Cache {

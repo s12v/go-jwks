@@ -7,7 +7,7 @@ A Go library to retrieve RSA public keys from a JWKS (JSON Web Key Set) endpoint
 ## Installation
 
 ```bash
-dep ensure --add "github.com/s12v/go-jwks"
+dep ensure --add "github.com/s12v/go-jwks@v0.0.1"
 ```
 
 ## Dependencies
@@ -30,11 +30,11 @@ import (
 )
 
 func main() {
-    jwksSource := jwks.NewWebSource("https://www.googleapis.com/oauth2/v3/certs")
+	jwksSource := jwks.NewWebSource("https://www.googleapis.com/oauth2/v3/certs")
 	jwksClient := jwks.NewDefaultClient(
 		jwksSource,
-		time.Hour, // Cache keys for 1 hour
-		10 * time.Minute, // Prefetch key 10 minutes before expiration
+		time.Hour,    // Refresh keys every 1 hour
+		12*time.Hour, // Expire keys after 12 hours
 	)
 
 	var jwk *jose.JSONWebKey
