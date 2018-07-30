@@ -5,6 +5,7 @@ import (
 	"github.com/square/go-jose"
 	"golang.org/x/sync/semaphore"
 	"time"
+	"log"
 )
 
 type JWKSClient interface {
@@ -57,13 +58,13 @@ func (c *jWKSClient) GetKey(keyId string, use string) (jwk *jose.JSONWebKey, err
 	val, found := c.cache.Get(keyId)
 	if found {
 		entry := val.(*cacheEntry)
-		if time.Now().After(time.Unix(entry.refresh, 0)) {
-			if c.sem.TryAcquire(1) {
-				go func() {
-					defer c.sem.Release(1)
-					c.refreshKey(keyId, use)
-				}()
-			}
+		if time.Now().After(time.Unix(entry.refresh, 0)) && c.sem.TryAcquire(1) {
+			go func() {
+				defer c.sem.Release(1)
+				if _, err := c.refreshKey(keyId, use); err != nil {
+					log.Printf("unable to refresh key: %v", err)
+				}
+			}()
 		}
 		return entry.jwk, nil
 	} else {
