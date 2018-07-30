@@ -6,13 +6,13 @@ import (
 	"time"
 )
 
-func TestDefaultCache_Get(t *testing.T) {
+func TestDefaultCache_GetWithExpiration(t *testing.T) {
 	c := &defaultCache{
-		cache.New(1, 0),
+		cache.New(time.Minute, 0),
 	}
 
-	c.cache.Set("key", "val", time.Minute)
-	val, expTime, found := c.cache.GetWithExpiration("key")
+	c.Set("key", "val")
+	val, expTime, found := c.GetWithExpiration("key")
 
 	if expTime.Before(time.Now()) {
 		t.Fatalf("expTime should be after now: %v", expTime)
@@ -27,14 +27,14 @@ func TestDefaultCache_Get(t *testing.T) {
 	}
 }
 
-func TestDefaultCache_GetExpired(t *testing.T) {
+func TestDefaultCache_GetWithExpiration_Expired(t *testing.T) {
 	c := &defaultCache{
-		cache.New(1, 0),
+		cache.New(time.Nanosecond, 0),
 	}
 
-	c.cache.Set("key", "val", time.Nanosecond)
+	c.Set("key", "val")
 	time.Sleep(10 * time.Millisecond)
-	val, expTime, found := c.cache.GetWithExpiration("key")
+	val, expTime, found := c.GetWithExpiration("key")
 
 	if expTime.After(time.Now()) {
 		t.Fatalf("expTime should be before now: %v", expTime)
