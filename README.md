@@ -56,6 +56,20 @@ Log:
 
 ## Caching
 
+### Key refresh and TTL
+
+There are two caching parameters:
+ - `refresh` - the key will be fetched from the source after this interval 
+ - `ttl` - if not used, the key will be deleted from cache 
+
+On the first request, the key is synchronously fetched from the key server and stored in the cache.
+On the next request after `refresh` interval, the key will be refreshed in the background (not affect response time).
+Only 1 key refresh is executed at the same time.
+
+If the key is not requested during `ttl` interval, it will be removed from cache.
+
+## Cache implementations
+
 Default cache is `github.com/patrickmn/go-cache` in-memory cache.
 You can provide your own cache implementation, see `cache.go`:
 
