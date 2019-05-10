@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"github.com/square/go-jose"
 	"golang.org/x/sync/semaphore"
-	"time"
 	"log"
+	"time"
 )
 
 type JWKSClient interface {

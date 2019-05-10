@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/square/go-jose"
-	"net/http"
 	"log"
+	"net/http"
 )
 
 type JWKSSource interface {

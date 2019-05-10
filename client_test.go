@@ -1,8 +1,8 @@
 package jwks
 
 import (
-	"testing"
 	"github.com/square/go-jose"
+	"testing"
 	"time"
 )
 

@@ -1,9 +1,9 @@
 package jwks
 
 import (
+	"fmt"
 	"github.com/patrickmn/go-cache"
 	"time"
-	"fmt"
 )
 
 type Cache interface {

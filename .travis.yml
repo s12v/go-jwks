@@ -1,16 +1,10 @@
 language: go
 
 go:
-  - "1.8"
-  - "1.9"
-  - "1.10"
-
-install:
-  - curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-  - dep ensure
+  - "1.12"
 
 script:
-  - go test . -v -coverprofile=coverage.txt -covermode=atomic
+  - make
 
 after_success:
   - bash <(curl -s https://codecov.io/bash)
