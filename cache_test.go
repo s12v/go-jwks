@@ -1,8 +1,8 @@
 package jwks
 
 import (
-	"testing"
 	"github.com/patrickmn/go-cache"
+	"testing"
 	"time"
 )
 
