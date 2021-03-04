@@ -25,10 +25,11 @@ go get github.com/s12v/go-jwks@v0.2.1
 package main
 
 import (
+	"log"
+	"time"
+
 	"github.com/s12v/go-jwks"
 	"github.com/square/go-jose"
-	"time"
-	"log"
 )
 
 func main() {
