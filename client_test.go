@@ -1,9 +1,10 @@
 package jwks
 
 import (
-	"github.com/square/go-jose"
 	"testing"
 	"time"
+
+	"github.com/square/go-jose"
 )
 
 func TestJWKSClient_GetKey(t *testing.T) {
@@ -40,7 +41,7 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		keyId,
 		&cacheEntry{
 			refresh: 0,
-			jwk: &mockJwk,
+			jwk:     &mockJwk,
 		},
 		time.Unix(0, 0),
 	)

@@ -2,10 +2,10 @@ package jwks
 
 import (
 	"fmt"
+	"time"
+
 	"github.com/square/go-jose"
 	"golang.org/x/sync/semaphore"
-	"log"
-	"time"
 )
 
 type JWKSClient interface {
@@ -62,7 +62,7 @@ func (c *jWKSClient) GetKey(keyId string, use string) (jwk *jose.JSONWebKey, err
 			go func() {
 				defer c.sem.Release(1)
 				if _, err := c.refreshKey(keyId, use); err != nil {
-					log.Printf("unable to refresh key: %v", err)
+					logger.Printf("unable to refresh key: %v", err)
 				}
 			}()
 		}

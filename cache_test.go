@@ -1,9 +1,10 @@
 package jwks
 
 import (
-	"github.com/patrickmn/go-cache"
 	"testing"
 	"time"
+
+	"github.com/patrickmn/go-cache"
 )
 
 func TestDefaultCache_Get(t *testing.T) {

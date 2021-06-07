@@ -26,10 +26,10 @@ func (c *jWKSClientMock) GetKey(keyId string, use string) (*jose.JSONWebKey, err
 	return mockKey(c.secret), nil
 }
 
-func mockKey(secret string) (*jose.JSONWebKey) {
+func mockKey(secret string) *jose.JSONWebKey {
 	return &jose.JSONWebKey{
 		KeyID:     "key1",
 		Algorithm: "HS256",
-		Key: []byte(secret),
+		Key:       []byte(secret),
 	}
 }

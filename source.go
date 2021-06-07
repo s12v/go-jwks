@@ -3,9 +3,9 @@ package jwks
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/square/go-jose"
-	"log"
 	"net/http"
+
+	"github.com/square/go-jose"
 )
 
 type JWKSSource interface {
@@ -17,15 +17,19 @@ type WebSource struct {
 	jwksUri string
 }
 
-func NewWebSource(jwksUri string) *WebSource {
+func NewWebSource(jwksUri string, client *http.Client) *WebSource {
+	if client == nil {
+		client = new(http.Client)
+	}
+
 	return &WebSource{
-		client:  new(http.Client),
+		client:  client,
 		jwksUri: jwksUri,
 	}
 }
 
 func (s *WebSource) JSONWebKeySet() (*jose.JSONWebKeySet, error) {
-	log.Printf("Fetchng JWKS from %s", s.jwksUri)
+	logger.Printf("Fetching JWKS from %s", s.jwksUri)
 	resp, err := s.client.Get(s.jwksUri)
 	if err != nil {
 		return nil, err
