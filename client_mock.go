@@ -4,25 +4,25 @@ import (
 	"github.com/square/go-jose"
 )
 
-type jWKSClientMock struct {
+type mockClient struct {
 	secret string
 }
 
-func NewMockClient(secret string) JWKSClient {
-	return &jWKSClientMock{
+func NewMockClient(secret string) Client {
+	return &mockClient{
 		secret: secret,
 	}
 }
 
-func (c *jWKSClientMock) GetSignatureKey(keyId string) (*jose.JSONWebKey, error) {
+func (c *mockClient) GetSignatureKey(keyID string) (*jose.JSONWebKey, error) {
 	return mockKey(c.secret), nil
 }
 
-func (c *jWKSClientMock) GetEncryptionKey(keyId string) (*jose.JSONWebKey, error) {
+func (c *mockClient) GetEncryptionKey(keyID string) (*jose.JSONWebKey, error) {
 	return mockKey(c.secret), nil
 }
 
-func (c *jWKSClientMock) GetKey(keyId string, use string) (*jose.JSONWebKey, error) {
+func (c *mockClient) GetKey(keyID string, use string) (*jose.JSONWebKey, error) {
 	return mockKey(c.secret), nil
 }
 

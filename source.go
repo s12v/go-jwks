@@ -8,29 +8,29 @@ import (
 	"github.com/square/go-jose"
 )
 
-type JWKSSource interface {
+type Source interface {
 	JSONWebKeySet() (*jose.JSONWebKeySet, error)
 }
 
 type WebSource struct {
 	client  *http.Client
-	jwksUri string
+	jwksURI string
 }
 
-func NewWebSource(jwksUri string, client *http.Client) *WebSource {
+func NewWebSource(jwksURI string, client *http.Client) *WebSource {
 	if client == nil {
 		client = new(http.Client)
 	}
 
 	return &WebSource{
 		client:  client,
-		jwksUri: jwksUri,
+		jwksURI: jwksURI,
 	}
 }
 
 func (s *WebSource) JSONWebKeySet() (*jose.JSONWebKeySet, error) {
-	logger.Printf("Fetching JWKS from %s", s.jwksUri)
-	resp, err := s.client.Get(s.jwksUri)
+	logger.Printf("Fetching JWKS from %s", s.jwksURI)
+	resp, err := s.client.Get(s.jwksURI)
 	if err != nil {
 		return nil, err
 	}

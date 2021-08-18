@@ -8,37 +8,37 @@ import (
 )
 
 func TestJWKSClient_GetKey(t *testing.T) {
-	keyId := "test-4317493287"
+	keyID := "test-4317493287"
 	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
-		KeyID: keyId,
+		KeyID: keyID,
 	}}})
 	cacheMock := NewMockCache()
 
 	client := NewClient(sourceMock, cacheMock, time.Minute)
 
-	jwk, err := client.GetKey(keyId, "sig")
+	jwk, err := client.GetKey(keyID, "sig")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if jwk.KeyID != keyId {
+	if jwk.KeyID != keyID {
 		t.Fatalf("unexpected keyID: %v", jwk.KeyID)
 	}
 }
 
 func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
-	keyId := "test-4317493287"
+	keyID := "test-4317493287"
 	mockJwk := jose.JSONWebKey{
-		KeyID: keyId,
+		KeyID: keyID,
 		Use:   "sig",
 	}
 	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
-		KeyID: keyId,
+		KeyID: keyID,
 		Use:   "enc",
 	}}})
 	cacheMock := NewMockCache()
 	cacheMock.SetWithExpiration(
-		keyId,
+		keyID,
 		&cacheEntry{
 			refresh: 0,
 			jwk:     &mockJwk,
@@ -48,7 +48,7 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 
 	client := NewClient(sourceMock, cacheMock, time.Minute)
 
-	key1, err := client.GetKey(keyId, "sig")
+	key1, err := client.GetKey(keyID, "sig")
 	time.Sleep(time.Millisecond * 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -57,7 +57,7 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		t.Fatalf("unexpected Use: %v", key1.Use)
 	}
 
-	key2, _ := cacheMock.Get(keyId)
+	key2, _ := cacheMock.Get(keyID)
 	if key2.(*cacheEntry).jwk.Use != "enc" {
 		t.Fatal("key should be updated in cache")
 	}
