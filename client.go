@@ -1,6 +1,7 @@
 package jwks
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -9,9 +10,9 @@ import (
 )
 
 type JWKSClient interface {
-	GetKey(keyId string, use string) (*jose.JSONWebKey, error)
-	GetEncryptionKey(keyId string) (*jose.JSONWebKey, error)
-	GetSignatureKey(keyId string) (*jose.JSONWebKey, error)
+	GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error)
+	GetEncryptionKey(ctx context.Context, keyId string) (*jose.JSONWebKey, error)
+	GetSignatureKey(ctx context.Context, keyId string) (*jose.JSONWebKey, error)
 }
 
 type jWKSClient struct {
@@ -46,34 +47,34 @@ func NewClient(source JWKSSource, cache Cache, refresh time.Duration) JWKSClient
 	}
 }
 
-func (c *jWKSClient) GetSignatureKey(keyId string) (*jose.JSONWebKey, error) {
-	return c.GetKey(keyId, "sig")
+func (c *jWKSClient) GetSignatureKey(ctx context.Context, keyId string) (*jose.JSONWebKey, error) {
+	return c.GetKey(ctx, keyId, "sig")
 }
 
-func (c *jWKSClient) GetEncryptionKey(keyId string) (*jose.JSONWebKey, error) {
-	return c.GetKey(keyId, "enc")
+func (c *jWKSClient) GetEncryptionKey(ctx context.Context, keyId string) (*jose.JSONWebKey, error) {
+	return c.GetKey(ctx, keyId, "enc")
 }
 
-func (c *jWKSClient) GetKey(keyId string, use string) (jwk *jose.JSONWebKey, err error) {
+func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk *jose.JSONWebKey, err error) {
 	val, found := c.cache.Get(keyId)
 	if found {
 		entry := val.(*cacheEntry)
 		if time.Now().After(time.Unix(entry.refresh, 0)) && c.sem.TryAcquire(1) {
 			go func() {
 				defer c.sem.Release(1)
-				if _, err := c.refreshKey(keyId, use); err != nil {
+				if _, err := c.refreshKey(ctx, keyId, use); err != nil {
 					logger.Printf("unable to refresh key: %v", err)
 				}
 			}()
 		}
 		return entry.jwk, nil
 	} else {
-		return c.refreshKey(keyId, use)
+		return c.refreshKey(ctx, keyId, use)
 	}
 }
 
-func (c *jWKSClient) refreshKey(keyId string, use string) (*jose.JSONWebKey, error) {
-	jwk, err := c.fetchJSONWebKey(keyId, use)
+func (c *jWKSClient) refreshKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
+	jwk, err := c.fetchJSONWebKey(ctx, keyId, use)
 	if err != nil {
 		return nil, err
 	}
@@ -89,8 +90,8 @@ func (c *jWKSClient) save(keyId string, jwk *jose.JSONWebKey) {
 	})
 }
 
-func (c *jWKSClient) fetchJSONWebKey(keyId string, use string) (*jose.JSONWebKey, error) {
-	jsonWebKeySet, err := c.source.JSONWebKeySet()
+func (c *jWKSClient) fetchJSONWebKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
+	jsonWebKeySet, err := c.source.JSONWebKeySet(ctx)
 	if err != nil {
 		return nil, err
 	}
