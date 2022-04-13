@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/square/go-jose"
+	"gopkg.in/square/go-jose.v2"
 )
 
 func TestJWKSClient_GetKey(t *testing.T) {

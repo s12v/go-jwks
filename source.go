@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/square/go-jose"
+	"gopkg.in/square/go-jose.v2"
 	"net/http"
 )
 
