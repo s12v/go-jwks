@@ -1,15 +1,15 @@
 package jwks
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"gopkg.in/square/go-jose.v2"
 	"net/http"
-
-	"github.com/square/go-jose"
 )
 
 type JWKSSource interface {
-	JSONWebKeySet() (*jose.JSONWebKeySet, error)
+	JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error)
 }
 
 type WebSource struct {
@@ -28,9 +28,17 @@ func NewWebSource(jwksUri string, client *http.Client) *WebSource {
 	}
 }
 
-func (s *WebSource) JSONWebKeySet() (*jose.JSONWebKeySet, error) {
+func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	logger.Printf("Fetching JWKS from %s", s.jwksUri)
-	resp, err := s.client.Get(s.jwksUri)
+
+	req, err := http.NewRequest("GET", s.jwksUri, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req = req.WithContext(ctx)
+
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
 	}

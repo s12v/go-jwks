@@ -1,7 +1,8 @@
 package jwks
 
 import (
-	"github.com/square/go-jose"
+	"context"
+	"gopkg.in/square/go-jose.v2"
 )
 
 type DummySource struct {
@@ -12,6 +13,6 @@ func NewDummySource(jwks *jose.JSONWebKeySet) *DummySource {
 	return &DummySource{Jwks: jwks}
 }
 
-func (s *DummySource) JSONWebKeySet() (*jose.JSONWebKeySet, error) {
+func (s *DummySource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	return s.Jwks, nil
 }

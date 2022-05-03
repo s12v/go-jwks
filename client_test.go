@@ -1,10 +1,11 @@
 package jwks
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"github.com/square/go-jose"
+	"gopkg.in/square/go-jose.v2"
 )
 
 func TestJWKSClient_GetKey(t *testing.T) {
@@ -13,10 +14,11 @@ func TestJWKSClient_GetKey(t *testing.T) {
 		KeyID: keyId,
 	}}})
 	cacheMock := NewMockCache()
+	ctx := context.TODO()
 
 	client := NewClient(sourceMock, cacheMock, time.Minute)
 
-	jwk, err := client.GetKey(keyId, "sig")
+	jwk, err := client.GetKey(ctx, keyId, "sig")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -45,10 +47,11 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		},
 		time.Unix(0, 0),
 	)
+	ctx := context.TODO()
 
 	client := NewClient(sourceMock, cacheMock, time.Minute)
 
-	key1, err := client.GetKey(keyId, "sig")
+	key1, err := client.GetKey(ctx, keyId, "sig")
 	time.Sleep(time.Millisecond * 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
