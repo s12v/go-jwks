@@ -9,6 +9,10 @@ import (
 	"gopkg.in/square/go-jose.v2"
 )
 
+const (
+	refreshTimeout = 15 * time.Second
+)
+
 type JWKSClient interface {
 	GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error)
 	GetEncryptionKey(ctx context.Context, keyId string) (*jose.JSONWebKey, error)
@@ -62,7 +66,9 @@ func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk 
 		if time.Now().After(time.Unix(entry.refresh, 0)) && c.sem.TryAcquire(1) {
 			go func() {
 				defer c.sem.Release(1)
-				if _, err := c.refreshKey(ctx, keyId, use); err != nil {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+				defer cancel()
+				if _, err := c.refreshKey(refreshCtx, keyId, use); err != nil {
 					logger.Printf("unable to refresh key: %v", err)
 				}
 			}()
