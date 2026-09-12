@@ -1,8 +1,12 @@
-.PHONY: all
-all: clean test
+.PHONY: all clean test vet
+
+all: clean vet test
 
 clean:
-	rm -rf ./bin || true
+	rm -f coverage.txt
+
+vet:
+	go vet ./...
 
 test:
-	go test -v ./... -coverprofile=coverage.txt -covermode=atomic
+	go test -race -v ./... -coverprofile=coverage.txt -covermode=atomic
