@@ -9,9 +9,9 @@ import (
 	"github.com/go-jose/go-jose/v4"
 )
 
-const (
-	refreshTimeout = 15 * time.Second
-)
+// refreshTimeout bounds a background key refresh, so that a hanging source
+// cannot block further refreshes forever.
+const refreshTimeout = 15 * time.Second
 
 type JWKSClient interface {
 	GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error)
@@ -65,7 +65,9 @@ func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk 
 		if time.Now().After(time.Unix(entry.refresh, 0)) && c.refreshing.CompareAndSwap(false, true) {
 			go func() {
 				defer c.refreshing.Store(false)
-				refreshCtx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+				// The caller's context is usually cancelled as soon as its request
+				// completes; keep its values (tracing etc.) but not its cancellation.
+				refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 				defer cancel()
 				if _, err := c.refreshKey(refreshCtx, keyId, use); err != nil {
 					logger.Printf("unable to refresh key: %v", err)
@@ -106,8 +108,12 @@ func (c *jWKSClient) fetchJSONWebKey(ctx context.Context, keyId string, use stri
 		return nil, fmt.Errorf("JWK is not found: %s", keyId)
 	}
 
-	for _, jwk := range keys {
-		return &jwk, nil
+	// Prefer a key with the requested "use"; fall back to the first key
+	// with the matching id (keys often omit "use" altogether).
+	for i := range keys {
+		if keys[i].Use == use {
+			return &keys[i], nil
+		}
 	}
-	return nil, fmt.Errorf("JWK is not found %s, use: %s", keyId, use)
+	return &keys[0], nil
 }
