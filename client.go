@@ -3,10 +3,10 @@ package jwks
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/semaphore"
-	"gopkg.in/square/go-jose.v2"
+	"github.com/go-jose/go-jose/v4"
 )
 
 const (
@@ -20,10 +20,10 @@ type JWKSClient interface {
 }
 
 type jWKSClient struct {
-	source  JWKSSource
-	cache   Cache
-	refresh time.Duration
-	sem     *semaphore.Weighted
+	source     JWKSSource
+	cache      Cache
+	refresh    time.Duration
+	refreshing atomic.Bool
 }
 
 type cacheEntry struct {
@@ -34,7 +34,7 @@ type cacheEntry struct {
 // Creates a new client with default cache implementation
 func NewDefaultClient(source JWKSSource, refresh time.Duration, ttl time.Duration) JWKSClient {
 	if refresh >= ttl {
-		panic(fmt.Sprintf("invalid refresh: %v greater or eaquals to ttl: %v", refresh, ttl))
+		panic(fmt.Sprintf("invalid refresh: %v greater or equal to ttl: %v", refresh, ttl))
 	}
 	if refresh < 0 {
 		panic(fmt.Sprintf("invalid refresh: %v", refresh))
@@ -47,7 +47,6 @@ func NewClient(source JWKSSource, cache Cache, refresh time.Duration) JWKSClient
 		source:  source,
 		cache:   cache,
 		refresh: refresh,
-		sem:     semaphore.NewWeighted(1),
 	}
 }
 
@@ -63,9 +62,9 @@ func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk 
 	val, found := c.cache.Get(keyId)
 	if found {
 		entry := val.(*cacheEntry)
-		if time.Now().After(time.Unix(entry.refresh, 0)) && c.sem.TryAcquire(1) {
+		if time.Now().After(time.Unix(entry.refresh, 0)) && c.refreshing.CompareAndSwap(false, true) {
 			go func() {
-				defer c.sem.Release(1)
+				defer c.refreshing.Store(false)
 				refreshCtx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 				defer cancel()
 				if _, err := c.refreshKey(refreshCtx, keyId, use); err != nil {

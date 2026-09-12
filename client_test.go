@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	"github.com/go-jose/go-jose/v4"
 )
 
 func TestJWKSClient_GetKey(t *testing.T) {
@@ -52,7 +52,6 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 	client := NewClient(sourceMock, cacheMock, time.Minute)
 
 	key1, err := client.GetKey(ctx, keyId, "sig")
-	time.Sleep(time.Millisecond * 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,9 +59,17 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		t.Fatalf("unexpected Use: %v", key1.Use)
 	}
 
-	key2, _ := cacheMock.Get(keyId)
-	if key2.(*cacheEntry).jwk.Use != "enc" {
-		t.Fatal("key should be updated in cache")
+	// the key is refreshed in the background; wait for it
+	deadline := time.Now().Add(time.Second)
+	for {
+		key2, _ := cacheMock.Get(keyId)
+		if key2.(*cacheEntry).jwk.Use == "enc" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("key should be updated in cache")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
