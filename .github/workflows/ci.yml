@@ -18,7 +18,7 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go vet ./...
       - run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         if: matrix.go == 'stable'
         with:
           files: coverage.txt
