@@ -31,16 +31,18 @@ func TestJWKSClient_GetKey(t *testing.T) {
 func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 	keyId := "test-4317493287"
 	mockJwk := jose.JSONWebKey{
-		KeyID: keyId,
-		Use:   "sig",
+		KeyID:     keyId,
+		Use:       "sig",
+		Algorithm: "cached",
 	}
 	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
-		KeyID: keyId,
-		Use:   "enc",
+		KeyID:     keyId,
+		Use:       "sig",
+		Algorithm: "fetched",
 	}}})
 	cacheMock := NewMockCache()
 	cacheMock.SetWithExpiration(
-		keyId,
+		cacheKey(keyId, "sig"),
 		&cacheEntry{
 			refresh: 0,
 			jwk:     &mockJwk,
@@ -55,15 +57,15 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if key1.Use != "sig" {
-		t.Fatalf("unexpected Use: %v", key1.Use)
+	if key1.Algorithm != "cached" {
+		t.Fatalf("expected the cached key, got alg=%q", key1.Algorithm)
 	}
 
 	// the key is refreshed in the background; wait for it
 	deadline := time.Now().Add(time.Second)
 	for {
-		key2, _ := cacheMock.Get(keyId)
-		if key2.(*cacheEntry).jwk.Use == "enc" {
+		key2, _ := cacheMock.Get(cacheKey(keyId, "sig"))
+		if key2.(*cacheEntry).jwk.Algorithm == "fetched" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -91,11 +93,12 @@ func (s *ctxAwareSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet
 func TestJWKSClient_BackgroundRefreshWithCancelledContext(t *testing.T) {
 	keyId := "test-4317493287"
 	source := &ctxAwareSource{&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
-		KeyID: keyId,
-		Use:   "enc",
+		KeyID:     keyId,
+		Use:       "sig",
+		Algorithm: "fetched",
 	}}}}
 	cacheMock := NewMockCache()
-	cacheMock.Set(keyId, &cacheEntry{refresh: 0, jwk: &jose.JSONWebKey{KeyID: keyId, Use: "sig"}})
+	cacheMock.Set(cacheKey(keyId, "sig"), &cacheEntry{refresh: 0, jwk: &jose.JSONWebKey{KeyID: keyId, Use: "sig", Algorithm: "cached"}})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -107,8 +110,8 @@ func TestJWKSClient_BackgroundRefreshWithCancelledContext(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for {
-		entry, _ := cacheMock.Get(keyId)
-		if entry.(*cacheEntry).jwk.Use == "enc" {
+		entry, _ := cacheMock.Get(cacheKey(keyId, "sig"))
+		if entry.(*cacheEntry).jwk.Algorithm == "fetched" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -136,14 +139,82 @@ func TestJWKSClient_GetKeyPrefersUse(t *testing.T) {
 		t.Fatalf("expected the 'sig' key, got use=%q", jwk.Use)
 	}
 
-	// no key with the requested use: fall back to the first one with the id
+	// no key with the requested use and none without use
 	client = NewClient(sourceMock, NewMockCache(), time.Minute)
-	jwk, err = client.GetKey(ctx, keyId, "other")
+	if jwk, err = client.GetKey(ctx, keyId, "other"); err == nil {
+		t.Fatalf("expected an error, got use=%q", jwk.Use)
+	}
+}
+
+func TestJWKSClient_GetKeyRejectsOtherUse(t *testing.T) {
+	keyId := "enc-only"
+	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{KeyID: keyId, Use: "enc"},
+	}})
+	client := NewClient(sourceMock, NewMockCache(), time.Minute)
+
+	if jwk, err := client.GetSignatureKey(context.TODO(), keyId); err == nil {
+		t.Fatalf("expected an error, got use=%q", jwk.Use)
+	}
+}
+
+func TestJWKSClient_GetKeyFallsBackToKeyWithoutUse(t *testing.T) {
+	keyId := "shared-kid"
+	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{KeyID: keyId, Use: "enc"},
+		{KeyID: keyId},
+	}})
+	client := NewClient(sourceMock, NewMockCache(), time.Minute)
+
+	jwk, err := client.GetSignatureKey(context.TODO(), keyId)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if jwk.Use != "" {
+		t.Fatalf("expected the key without use, got use=%q", jwk.Use)
+	}
+}
+
+func TestJWKSClient_GetKeyAnyUse(t *testing.T) {
+	keyId := "enc-only"
+	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{KeyID: keyId, Use: "enc"},
+	}})
+	client := NewClient(sourceMock, NewMockCache(), time.Minute)
+
+	jwk, err := client.GetKey(context.TODO(), keyId, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if jwk.Use != "enc" {
-		t.Fatalf("expected the first key, got use=%q", jwk.Use)
+		t.Fatalf("unexpected use: %q", jwk.Use)
+	}
+}
+
+// A key cached for one use must not be served for another.
+func TestJWKSClient_CachePerUse(t *testing.T) {
+	keyId := "shared-kid"
+	sourceMock := NewDummySource(&jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{KeyID: keyId, Use: "enc"},
+		{KeyID: keyId, Use: "sig"},
+	}})
+	ctx := context.TODO()
+	client := NewClient(sourceMock, NewMockCache(), time.Minute)
+
+	enc, err := client.GetEncryptionKey(ctx, keyId)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if enc.Use != "enc" {
+		t.Fatalf("expected the 'enc' key, got use=%q", enc.Use)
+	}
+
+	sig, err := client.GetSignatureKey(ctx, keyId)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sig.Use != "sig" {
+		t.Fatalf("expected the 'sig' key, got use=%q", sig.Use)
 	}
 }
 

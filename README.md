@@ -55,6 +55,16 @@ func main() {
 
 `NewWebSource` accepts an optional `*http.Client`; when `nil` is passed, a client with a 10 second timeout is used.
 
+## Key use
+
+`GetSignatureKey` and `GetEncryptionKey` return a key with the matching `use` (`sig` or `enc`),
+or, if there is none, a key with no `use` at all. A key that declares a different `use` is never returned:
+for example, `GetSignatureKey` fails for a key marked `"use": "enc"`.
+`GetKey` with an empty `use` returns any key with the given id.
+
+The library does not check the key type or algorithm: verify them against what you expect,
+e.g. by passing the allowed algorithms to `jose.ParseSigned`.
+
 ## Caching
 
 ### Key refresh and TTL

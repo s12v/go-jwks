@@ -58,8 +58,11 @@ func (c *jWKSClient) GetEncryptionKey(ctx context.Context, keyId string) (*jose.
 	return c.GetKey(ctx, keyId, "enc")
 }
 
+// GetKey returns the key with the given id and "use" ("sig" or "enc"), or a
+// key with the given id that has no "use". A key that declares a different
+// "use" is not returned. An empty use matches any key.
 func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk *jose.JSONWebKey, err error) {
-	val, found := c.cache.Get(keyId)
+	val, found := c.cache.Get(cacheKey(keyId, use))
 	if found {
 		entry := val.(*cacheEntry)
 		if time.Now().After(time.Unix(entry.refresh, 0)) && c.refreshing.CompareAndSwap(false, true) {
@@ -86,12 +89,12 @@ func (c *jWKSClient) refreshKey(ctx context.Context, keyId string, use string) (
 		return nil, err
 	}
 
-	c.save(keyId, jwk)
+	c.save(cacheKey(keyId, use), jwk)
 	return jwk, nil
 }
 
-func (c *jWKSClient) save(keyId string, jwk *jose.JSONWebKey) {
-	c.cache.Set(keyId, &cacheEntry{
+func (c *jWKSClient) save(key string, jwk *jose.JSONWebKey) {
+	c.cache.Set(key, &cacheEntry{
 		jwk:     jwk,
 		refresh: time.Now().Add(c.refresh).Unix(),
 	})
@@ -108,12 +111,32 @@ func (c *jWKSClient) fetchJSONWebKey(ctx context.Context, keyId string, use stri
 		return nil, fmt.Errorf("JWK is not found: %s", keyId)
 	}
 
-	// Prefer a key with the requested "use"; fall back to the first key
-	// with the matching id (keys often omit "use" altogether).
+	// Prefer a key with the requested "use"; fall back to a key without
+	// "use" (the parameter is optional and often omitted). A key that
+	// declares a different "use" is never returned.
+	var fallback *jose.JSONWebKey
 	for i := range keys {
-		if keys[i].Use == use {
+		switch keys[i].Use {
+		case use:
 			return &keys[i], nil
+		case "":
+			if fallback == nil {
+				fallback = &keys[i]
+			}
 		}
 	}
-	return &keys[0], nil
+	if fallback != nil {
+		return fallback, nil
+	}
+	if use == "" {
+		// no particular use requested
+		return &keys[0], nil
+	}
+	return nil, fmt.Errorf("JWK is not found: %s, use: %s", keyId, use)
+}
+
+// cacheKey makes cache entries specific to the requested use, so that a key
+// fetched for one use is never served for another.
+func cacheKey(keyId string, use string) string {
+	return use + ":" + keyId
 }
