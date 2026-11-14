@@ -70,15 +70,58 @@ e.g. by passing the allowed algorithms to `jose.ParseSigned`.
 ### Key refresh and TTL
 
 There are two caching parameters:
- - `refresh` - the key will be fetched from the source after this interval
- - `ttl` - if not used, the key will be deleted from cache
+ - `refresh` - how long a cached key is served before the key set is fetched again
+ - `ttl` - how long a key that could not be refreshed stays in the default cache
 
-On the first request, the key is synchronously fetched from the key server and stored in the cache.
-On the next request after `refresh` interval, the key is refreshed in the background (does not affect response time).
-Only one key refresh is executed at a time. The background refresh does not depend on the caller's context
-and is bounded by a 15 second timeout.
+On the first request, the key set is synchronously fetched from the key server and the key is stored in the cache.
+On the next request after `refresh` interval, the key is still returned at once and the key set is fetched
+in the background (does not affect response time). The background fetch does not depend on the caller's context.
 
-If the key is not requested during `ttl` interval, it will be removed from cache.
+A key that was not requested for more than 10 seconds after it became due for a refresh is not served unchecked:
+the request waits for the key set to be fetched.
+
+If the key server is unavailable, cached keys keep being served until `ttl` expires.
+
+### Revoked keys
+
+A key that is no longer in the key set is dropped from the cache, without waiting for `ttl`.
+Unless the key server is unavailable, a key is not served for longer than `refresh` plus 10 seconds
+(plus the time a request to the key server takes) after the key set it was last seen in was fetched.
+Choose `refresh` accordingly.
+
+A key set fetched for any reason applies to all cached keys right away, so a key can be dropped sooner than that.
+
+A response without keys is treated as a failure of the key server, not as a revocation of every key.
+A response that lacks some of the keys cannot be told from a revocation: those keys are dropped
+and picked up again by a later fetch.
+
+### Unknown keys and load on the key server
+
+Key ids come from tokens that are not verified yet, so anyone can send a token with a random `kid`.
+To keep such requests from turning into requests to the key server:
+
+ - concurrent cache misses share a single request to the source;
+ - the fetched key set is reused for 10 seconds: a key that is not in it is reported as not found
+   without contacting the source. Nothing is stored per unknown key id;
+ - after a failed request, the source is not asked again for 1 second; the error is returned in the meantime.
+
+The other side of it is that a key added to the key set may stay unknown for up to 10 seconds,
+and that cached keys are not refreshed more often than that, even if `refresh` is shorter.
+Change the interval with `WithMinFetchInterval` (`0` turns both limits off):
+
+```go
+jwksClient := jwks.NewDefaultClient(jwksSource, time.Hour, 12*time.Hour,
+	jwks.WithMinFetchInterval(time.Minute))
+```
+
+A request to the source is shared, so it is not cancelled with the context of the caller that started it:
+that caller returns as soon as its context is done, the request goes on for the others.
+It is given up on after 15 seconds, even if the source ignores its context.
+
+### Errors
+
+When there is no key with the requested id and use, the error wraps `jwks.ErrKeyNotFound` (check with `errors.Is`).
+Any other error means that the key set could not be loaded, or that the caller's context is done.
 
 ### Cache implementations
 
@@ -109,7 +152,7 @@ type JWKSSource interface {
 
 ## Logging
 
-Background refresh errors are logged with the standard `log` package by default.
+Failed requests to the source and keys dropped from the cache are logged with the standard `log` package by default.
 Provide your own logger (anything with a `Printf(format string, v ...interface{})` method) or silence it:
 
 ```go
