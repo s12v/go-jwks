@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,17 +12,30 @@ import (
 	"github.com/go-jose/go-jose/v4"
 )
 
-// fetchTimeout bounds a single request to the source, so that a hanging
-// source cannot block further fetches forever.
-const fetchTimeout = 15 * time.Second
+const (
+	// defaultFetchTimeout bounds a single request to the source. A source
+	// that has not answered by then is given up on, even if it ignores its
+	// context, so that it cannot block further requests forever.
+	defaultFetchTimeout = 15 * time.Second
+
+	// backgroundRefreshWindow is how long a cached key that is due for a
+	// refresh is still served without waiting, while the key set is fetched
+	// in the background. A key that is due for longer than that (it was not
+	// requested in the meantime, or the refresh did not finish) is checked
+	// against the source before it is served.
+	backgroundRefreshWindow = 10 * time.Second
+
+	// maxFailureBackoff is the longest pause between two requests to a
+	// failing source.
+	maxFailureBackoff = time.Second
+)
 
 // DefaultMinFetchInterval is the default minimum interval between two
 // requests to the source, see WithMinFetchInterval.
 const DefaultMinFetchInterval = 10 * time.Second
 
 // ErrKeyNotFound is returned (wrapped) when the key set has no key with the
-// requested id and use. Any other error means that the key set could not be
-// loaded.
+// requested id and use.
 var ErrKeyNotFound = errors.New("JWK is not found")
 
 type JWKSClient interface {
@@ -33,15 +47,19 @@ type JWKSClient interface {
 // Option configures a client created by NewClient or NewDefaultClient.
 type Option func(*jWKSClient)
 
-// WithMinFetchInterval sets the minimum interval between two requests to the
-// source. A key set that was fetched less than d ago is reused instead of
-// being fetched again, so a key that is not in it is reported as not found
-// without contacting the source. This limits the load that requests with
-// unknown key ids can put on the key server to one request per d; the price
-// is that a key added to the key set may stay unknown for up to d.
+// WithMinFetchInterval sets the minimum interval between two successful
+// requests to the source. A key set that was fetched less than d ago is
+// reused instead of being fetched again, so a key that is not in it is
+// reported as not found without contacting the source. This limits the load
+// that requests with unknown key ids can put on the key server; the price is
+// that a key added to the key set may stay unknown for up to d. Cached keys
+// are not refreshed more often than that either.
+//
+// After a failed request the source is not queried again for one second, or
+// for d if that is shorter; the error is returned in the meantime.
 //
 // The default is DefaultMinFetchInterval. Zero or a negative value disables
-// the limit: every cache miss then queries the source (concurrent misses
+// both limits: every cache miss then queries the source (concurrent misses
 // still share one request).
 func WithMinFetchInterval(d time.Duration) Option {
 	return func(c *jWKSClient) {
@@ -54,29 +72,44 @@ type jWKSClient struct {
 	cache            Cache
 	refresh          time.Duration
 	minFetchInterval time.Duration
-	refreshing       atomic.Bool
+	fetchTimeout     time.Duration
 	now              func() time.Time
 
-	mu        sync.Mutex
-	inflight  *fetchCall          // request to the source in progress, if any
-	keySet    *jose.JSONWebKeySet // last key set fetched successfully
-	fetchedAt time.Time
+	refreshing atomic.Bool
+	// last key set fetched successfully
+	current atomic.Pointer[keySetSnapshot]
+
+	mu       sync.Mutex
+	inflight *fetchCall // request to the source in progress, if any
+	// outcome of the last request to the source, if it failed
+	lastErr  error
+	failedAt time.Time
+}
+
+type keySetSnapshot struct {
+	keySet     *jose.JSONWebKeySet
+	fetchedAt  time.Time
+	generation uint64
 }
 
 // fetchCall is a request to the source shared by everyone who needs the key
 // set while it is in progress.
 type fetchCall struct {
-	done   chan struct{}
-	keySet *jose.JSONWebKeySet
-	err    error
+	done     chan struct{}
+	snapshot *keySetSnapshot
+	err      error
+	waiters  int
 }
 
-// cacheEntry with a nil jwk marks a key that was cached and then disappeared
+// cacheEntry is a key together with the key set it was last seen in.
+//
+// An entry with a nil jwk marks a key that was cached and then disappeared
 // from the key set. Cache has no way to delete an entry, so it is overwritten
 // with such a marker instead.
 type cacheEntry struct {
-	jwk     *jose.JSONWebKey
-	refresh int64
+	jwk        *jose.JSONWebKey
+	checkedAt  time.Time
+	generation uint64
 }
 
 // Creates a new client with default cache implementation
@@ -96,10 +129,13 @@ func NewClient(source JWKSSource, cache Cache, refresh time.Duration, opts ...Op
 		cache:            cache,
 		refresh:          refresh,
 		minFetchInterval: DefaultMinFetchInterval,
+		fetchTimeout:     defaultFetchTimeout,
 		now:              time.Now,
 	}
 	for _, opt := range opts {
-		opt(c)
+		if opt != nil {
+			opt(c)
+		}
 	}
 	return c
 }
@@ -117,66 +153,115 @@ func (c *jWKSClient) GetEncryptionKey(ctx context.Context, keyId string) (*jose.
 // "use" is not returned. An empty use matches any key.
 //
 // If there is no such key, the error wraps ErrKeyNotFound.
-func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (jwk *jose.JSONWebKey, err error) {
-	if val, found := c.cache.Get(cacheKey(keyId, use)); found {
-		if entry := val.(*cacheEntry); entry.jwk != nil {
-			if c.now().After(time.Unix(entry.refresh, 0)) && c.refreshing.CompareAndSwap(false, true) {
-				go c.refreshKey(ctx, keyId, use)
-			}
-			return entry.jwk, nil
-		}
+func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
+	val, found := c.cache.Get(cacheKey(keyId, use))
+	if !found {
+		return c.loadKey(ctx, keyId, use)
 	}
-	return c.loadKey(ctx, keyId, use)
+	entry := val.(*cacheEntry)
+	if entry.jwk == nil {
+		return c.loadKey(ctx, keyId, use)
+	}
+	jwk, checkedAt := entry.jwk, entry.checkedAt
+
+	// A key set fetched since the key was cached is already in memory:
+	// whatever it says about the key takes precedence.
+	if snapshot := c.current.Load(); snapshot != nil && snapshot.generation != entry.generation {
+		var err error
+		if jwk, err = c.readKey(snapshot, keyId, use); err != nil {
+			c.drop(keyId, use, err)
+			return nil, err
+		}
+		checkedAt = snapshot.fetchedAt
+	}
+
+	// The key set is not fetched more often than minFetchInterval, so
+	// there is no point in refreshing a key more often than that.
+	maxAge := max(c.refresh, c.minFetchInterval)
+	age := c.now().Sub(checkedAt)
+	if age <= maxAge {
+		return jwk, nil
+	}
+	if age <= maxAge+backgroundRefreshWindow || c.sourceFailing() {
+		c.refreshInBackground(ctx)
+		return jwk, nil
+	}
+
+	// The key was last seen in the key set too long ago to trust it.
+	fresh, err := c.loadKey(ctx, keyId, use)
+	switch {
+	case err == nil:
+		return fresh, nil
+	case errors.Is(err, ErrKeyNotFound):
+		c.drop(keyId, use, err)
+		return nil, err
+	case ctx.Err() != nil:
+		return nil, err
+	}
+	// The source is unavailable: better an old key than none.
+	return jwk, nil
 }
 
-// refreshKey reloads a cached key in the background. A key that is gone from
-// the key set is dropped from the cache; if the key set cannot be loaded, the
-// cached key stays.
-func (c *jWKSClient) refreshKey(ctx context.Context, keyId string, use string) {
-	defer c.refreshing.Store(false)
-	// The caller's context is usually cancelled as soon as its request
-	// completes; keep its values (tracing etc.) but not its cancellation.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
-	defer cancel()
-
-	_, err := c.loadKey(ctx, keyId, use)
-	switch {
-	case errors.Is(err, ErrKeyNotFound):
-		c.cache.Set(cacheKey(keyId, use), &cacheEntry{})
-		logger.Printf("key removed from cache: %v", err)
-	case err != nil:
-		logger.Printf("unable to refresh key: %v", err)
+// refreshInBackground fetches the key set without making the caller wait.
+// Cached keys pick the new key set up the next time they are requested.
+func (c *jWKSClient) refreshInBackground(ctx context.Context) {
+	if !c.refreshing.CompareAndSwap(false, true) {
+		return
 	}
+	c.mu.Lock()
+	snapshot, err := c.recentOutcome()
+	c.mu.Unlock()
+	if snapshot != nil || err != nil {
+		// too early for another request to the source
+		c.refreshing.Store(false)
+		return
+	}
+	go func() {
+		defer c.refreshing.Store(false)
+		// The caller's context is usually cancelled as soon as its request
+		// completes; keep its values (tracing etc.) but not its cancellation.
+		// A failure is logged by fetch.
+		_, _ = c.loadKeySet(context.WithoutCancel(ctx))
+	}()
 }
 
 // loadKey looks the key up in the key set and caches it if it is there.
 // Nothing is cached for a key that is not: key ids come from untrusted
 // tokens, so there may be any number of them.
 func (c *jWKSClient) loadKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
-	keySet, err := c.loadKeySet(ctx)
+	snapshot, err := c.loadKeySet(ctx)
 	if err != nil {
 		return nil, err
 	}
-	jwk, err := findKey(keySet, keyId, use)
-	if err != nil {
-		return nil, err
-	}
+	return c.readKey(snapshot, keyId, use)
+}
 
+func (c *jWKSClient) readKey(snapshot *keySetSnapshot, keyId string, use string) (*jose.JSONWebKey, error) {
+	jwk, err := findKey(snapshot.keySet, keyId, use)
+	if err != nil {
+		return nil, err
+	}
 	c.cache.Set(cacheKey(keyId, use), &cacheEntry{
-		jwk:     jwk,
-		refresh: c.now().Add(c.refresh).Unix(),
+		jwk:        jwk,
+		checkedAt:  snapshot.fetchedAt,
+		generation: snapshot.generation,
 	})
 	return jwk, nil
 }
 
+// drop removes a cached key that is no longer in the key set.
+func (c *jWKSClient) drop(keyId string, use string, reason error) {
+	c.cache.Set(cacheKey(keyId, use), &cacheEntry{})
+	logger.Printf("key removed from cache: %v", reason)
+}
+
 // loadKeySet returns the key set fetched within the last minFetchInterval,
 // or else fetches it from the source. Concurrent callers share one request.
-func (c *jWKSClient) loadKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
+func (c *jWKSClient) loadKeySet(ctx context.Context) (*keySetSnapshot, error) {
 	c.mu.Lock()
-	if c.keySet != nil && c.now().Sub(c.fetchedAt) < c.minFetchInterval {
-		keySet := c.keySet
+	if snapshot, err := c.recentOutcome(); snapshot != nil || err != nil {
 		c.mu.Unlock()
-		return keySet, nil
+		return snapshot, err
 	}
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
@@ -190,39 +275,104 @@ func (c *jWKSClient) loadKeySet(ctx context.Context) (*jose.JSONWebKeySet, error
 		// with the context of the caller that happened to start it.
 		go c.fetch(context.WithoutCancel(ctx), call)
 	}
+	call.waiters++
 	c.mu.Unlock()
 
 	select {
 	case <-call.done:
-		return call.keySet, call.err
+		return call.snapshot, call.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
+// recentOutcome returns the result of the last request to the source if it
+// is too early for another one, and nils if a request is due. c.mu must be
+// held.
+func (c *jWKSClient) recentOutcome() (*keySetSnapshot, error) {
+	now := c.now()
+	if snapshot := c.current.Load(); snapshot != nil && now.Sub(snapshot.fetchedAt) < c.minFetchInterval {
+		return snapshot, nil
+	}
+	if c.lastErr != nil && now.Sub(c.failedAt) < min(c.minFetchInterval, maxFailureBackoff) {
+		return nil, c.lastErr
+	}
+	return nil, nil
+}
+
+func (c *jWKSClient) sourceFailing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastErr != nil
+}
+
 func (c *jWKSClient) fetch(ctx context.Context, call *fetchCall) {
-	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
 	defer cancel()
 
-	defer func() {
-		// A panic here would otherwise take the whole process down and
-		// could not be recovered by the callers.
-		if r := recover(); r != nil {
-			call.keySet, call.err = nil, fmt.Errorf("JWKS source panicked: %v", r)
+	keySet, err := c.querySource(ctx)
+
+	c.mu.Lock()
+	if err == nil {
+		call.snapshot = &keySetSnapshot{keySet: keySet, fetchedAt: c.now(), generation: 1}
+		if previous := c.current.Load(); previous != nil {
+			call.snapshot.generation = previous.generation + 1
 		}
-		c.mu.Lock()
-		if call.err == nil {
-			c.keySet, c.fetchedAt = call.keySet, c.now()
-		}
-		c.inflight = nil
-		c.mu.Unlock()
-		close(call.done)
+		c.current.Store(call.snapshot)
+	} else {
+		call.err = err
+		c.failedAt = c.now()
+	}
+	c.lastErr = err
+	c.inflight = nil
+	c.mu.Unlock()
+	close(call.done)
+
+	if err != nil {
+		logger.Printf("unable to fetch JWKS: %v", err)
+	}
+}
+
+// querySource asks the source for the key set and makes sure that an answer
+// comes back by the deadline of ctx, whatever the source does.
+func (c *jWKSClient) querySource(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	type result struct {
+		keySet *jose.JSONWebKeySet
+		err    error
+	}
+	results := make(chan result, 1)
+	go func() {
+		// reported if the source exits the goroutine without returning
+		res := result{err: errors.New("JWKS source did not return")}
+		defer func() {
+			// A panic here would otherwise take the whole process down
+			// and could not be recovered by the callers.
+			if r := recover(); r != nil {
+				res = result{err: fmt.Errorf("JWKS source panicked: %v", r)}
+			}
+			results <- res
+		}()
+		keySet, err := c.source.JSONWebKeySet(ctx)
+		res = result{keySet, err}
 	}()
 
-	call.keySet, call.err = c.source.JSONWebKeySet(ctx)
-	if call.err == nil && call.keySet == nil {
-		call.err = errors.New("JWKS source returned no key set")
+	var res result
+	select {
+	case res = <-results:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("JWKS source did not respond: %w", ctx.Err())
 	}
+	if res.err != nil {
+		return nil, res.err
+	}
+	// A key server always has keys. An empty answer is a malfunction (or
+	// an error body that happens to parse) and must not pass for "all keys
+	// are revoked".
+	if res.keySet == nil || len(res.keySet.Keys) == 0 {
+		return nil, errors.New("JWKS source returned no keys")
+	}
+	// The source may keep using the key set it returned.
+	return &jose.JSONWebKeySet{Keys: slices.Clone(res.keySet.Keys)}, nil
 }
 
 func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWebKey, error) {

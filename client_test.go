@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,14 +46,11 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		Algorithm: "fetched",
 	}}})
 	cacheMock := NewMockCache()
-	cacheMock.SetWithExpiration(
-		cacheKey(keyId, "sig"),
-		&cacheEntry{
-			refresh: 0,
-			jwk:     &mockJwk,
-		},
-		time.Unix(0, 0),
-	)
+	// due for a refresh
+	cacheMock.Set(cacheKey(keyId, "sig"), &cacheEntry{
+		jwk:       &mockJwk,
+		checkedAt: time.Now().Add(-time.Minute - time.Second),
+	})
 	ctx := context.TODO()
 
 	client := NewClient(sourceMock, cacheMock, time.Minute)
@@ -64,18 +63,11 @@ func TestJWKSClient_GetKeyWithPrefetch(t *testing.T) {
 		t.Fatalf("expected the cached key, got alg=%q", key1.Algorithm)
 	}
 
-	// the key is refreshed in the background; wait for it
-	deadline := time.Now().Add(time.Second)
-	for {
-		key2, _ := cacheMock.Get(cacheKey(keyId, "sig"))
-		if key2.(*cacheEntry).jwk.Algorithm == "fetched" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("key should be updated in cache")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	// the key set is refreshed in the background; wait for it
+	waitFor(t, "the refreshed key", func() bool {
+		key2, err := client.GetKey(ctx, keyId, "sig")
+		return err == nil && key2.Algorithm == "fetched"
+	})
 }
 
 // ctxAwareSource fails when the context it is called with is already done,
@@ -101,7 +93,10 @@ func TestJWKSClient_BackgroundRefreshWithCancelledContext(t *testing.T) {
 		Algorithm: "fetched",
 	}}}}
 	cacheMock := NewMockCache()
-	cacheMock.Set(cacheKey(keyId, "sig"), &cacheEntry{refresh: 0, jwk: &jose.JSONWebKey{KeyID: keyId, Use: "sig", Algorithm: "cached"}})
+	cacheMock.Set(cacheKey(keyId, "sig"), &cacheEntry{
+		jwk:       &jose.JSONWebKey{KeyID: keyId, Use: "sig", Algorithm: "cached"},
+		checkedAt: time.Now().Add(-time.Minute - time.Second),
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -111,17 +106,10 @@ func TestJWKSClient_BackgroundRefreshWithCancelledContext(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		entry, _ := cacheMock.Get(cacheKey(keyId, "sig"))
-		if entry.(*cacheEntry).jwk.Algorithm == "fetched" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("key should be refreshed despite the cancelled caller context")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, "the key to be refreshed despite the cancelled caller context", func() bool {
+		jwk, err := client.GetKey(ctx, keyId, "sig")
+		return err == nil && jwk.Algorithm == "fetched"
+	})
 }
 
 func TestJWKSClient_GetKeyPrefersUse(t *testing.T) {
@@ -287,6 +275,12 @@ func (s *countingSource) set(err error, keys ...jose.JSONWebKey) {
 	s.jwks, s.err = &jose.JSONWebKeySet{Keys: keys}, err
 }
 
+func (s *countingSource) setBlock(block chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.block = block
+}
+
 func (s *countingSource) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -320,7 +314,7 @@ func newTestClient(source JWKSSource, refresh time.Duration, opts ...Option) (*j
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -329,11 +323,83 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// waitForWaiters waits until n callers wait for the request in progress.
+func waitForWaiters(t *testing.T, client *jWKSClient, n int) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%d callers to wait for the source", n), func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.inflight != nil && client.inflight.waiters == n
+	})
+}
+
+// waitForIdle waits until the source has been asked n times and nothing is
+// in progress.
+func waitForIdle(t *testing.T, client *jWKSClient, source *countingSource, n int) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("request %d to the source to finish", n), func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return source.callCount() == n && client.inflight == nil && !client.refreshing.Load()
+	})
+}
+
+func sigKey(keyId string) jose.JSONWebKey {
+	return jose.JSONWebKey{KeyID: keyId, Use: "sig"}
+}
+
+func expectKey(t *testing.T, client JWKSClient, keyId string) {
+	t.Helper()
+	// fail rather than hang if the client waits for a blocked source
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	jwk, err := client.GetSignatureKey(ctx, keyId)
+	if err != nil {
+		t.Fatalf("unexpected error for %s: %v", keyId, err)
+	}
+	if jwk.KeyID != keyId {
+		t.Fatalf("expected key %s, got %s", keyId, jwk.KeyID)
+	}
+}
+
+func expectNotFound(t *testing.T, client JWKSClient, keyId string) {
+	t.Helper()
+	if _, err := client.GetSignatureKey(context.Background(), keyId); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound for %s, got: %v", keyId, err)
+	}
+}
+
+// expectSourceError expects an error that is not "key not found".
+func expectSourceError(t *testing.T, client JWKSClient, keyId string) {
+	t.Helper()
+	if _, err := client.GetSignatureKey(context.Background(), keyId); err == nil || errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected a source error for %s, got: %v", keyId, err)
+	}
+}
+
+func expectCalls(t *testing.T, source *countingSource, n int) {
+	t.Helper()
+	if calls := source.callCount(); calls != n {
+		t.Fatalf("expected %d requests to the source, got %d", n, calls)
+	}
+}
+
+func TestNewClient_Defaults(t *testing.T) {
+	client := NewClient(newCountingSource(), NewMockCache(), time.Minute, nil).(*jWKSClient)
+	if client.minFetchInterval != DefaultMinFetchInterval || DefaultMinFetchInterval != 10*time.Second {
+		t.Fatalf("unexpected min fetch interval: %v", client.minFetchInterval)
+	}
+	if client.fetchTimeout != 15*time.Second {
+		t.Fatalf("unexpected fetch timeout: %v", client.fetchTimeout)
+	}
+}
+
 // Concurrent cache misses must share a single request to the source.
 func TestJWKSClient_ConcurrentMissesShareOneFetch(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "known", Use: "sig"})
+	source := newCountingSource(sigKey("known"))
 	source.block = make(chan struct{})
-	client, _ := newTestClient(source, time.Minute)
+	// without the interval, a caller that came late would fetch again
+	client, _ := newTestClient(source, time.Minute, WithMinFetchInterval(0))
 
 	const n = 50
 	errs := make(chan error, n)
@@ -357,9 +423,7 @@ func TestJWKSClient_ConcurrentMissesShareOneFetch(t *testing.T) {
 		}()
 	}
 
-	waitFor(t, "the request to the source", func() bool { return source.callCount() > 0 })
-	// let the other callers reach the source, if they are going to
-	time.Sleep(50 * time.Millisecond)
+	waitForWaiters(t, client, n)
 	close(source.block)
 
 	for i := 0; i < n; i++ {
@@ -367,33 +431,22 @@ func TestJWKSClient_ConcurrentMissesShareOneFetch(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	if calls := source.callCount(); calls != 1 {
-		t.Fatalf("expected 1 request to the source, got %d", calls)
-	}
+	expectCalls(t, source, 1)
 }
 
 // Unknown key ids must not make the client fetch the key set on every request.
 func TestJWKSClient_UnknownKeysDoNotRefetch(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "known", Use: "sig"})
-	client, clock := newTestClient(source, time.Hour, WithMinFetchInterval(10*time.Second))
-	ctx := context.Background()
+	source := newCountingSource(sigKey("known"))
+	client, clock := newTestClient(source, time.Hour)
 
 	for i := 0; i < 100; i++ {
-		if _, err := client.GetSignatureKey(ctx, fmt.Sprintf("random-%d", i)); !errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("expected ErrKeyNotFound, got: %v", err)
-		}
+		expectNotFound(t, client, fmt.Sprintf("random-%d", i))
 	}
-	if calls := source.callCount(); calls != 1 {
-		t.Fatalf("expected 1 request to the source, got %d", calls)
-	}
+	expectCalls(t, source, 1)
 
 	// a key that is in the key set is served from it as well
-	if _, err := client.GetSignatureKey(ctx, "known"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if calls := source.callCount(); calls != 1 {
-		t.Fatalf("expected 1 request to the source, got %d", calls)
-	}
+	expectKey(t, client, "known")
+	expectCalls(t, source, 1)
 
 	// nothing is remembered per unknown key id
 	if n := len(client.cache.(*mockCache).m); n != 1 {
@@ -401,143 +454,276 @@ func TestJWKSClient_UnknownKeysDoNotRefetch(t *testing.T) {
 	}
 
 	// once the interval has passed, the key set is fetched again
-	clock.Advance(10 * time.Second)
+	clock.Advance(DefaultMinFetchInterval)
 	for i := 0; i < 100; i++ {
-		if _, err := client.GetSignatureKey(ctx, fmt.Sprintf("random-%d", i)); !errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("expected ErrKeyNotFound, got: %v", err)
-		}
+		expectNotFound(t, client, fmt.Sprintf("random-%d", i))
 	}
-	if calls := source.callCount(); calls != 2 {
-		t.Fatalf("expected 2 requests to the source, got %d", calls)
-	}
+	expectCalls(t, source, 2)
 }
 
 // A key added to the key set is found once the minimum interval has passed.
 func TestJWKSClient_NewKeyIsFoundAfterMinFetchInterval(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "old", Use: "sig"})
+	source := newCountingSource(sigKey("old"))
 	client, clock := newTestClient(source, time.Hour, WithMinFetchInterval(10*time.Second))
-	ctx := context.Background()
 
-	if _, err := client.GetSignatureKey(ctx, "new"); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("expected ErrKeyNotFound, got: %v", err)
-	}
+	expectNotFound(t, client, "new")
 
-	source.set(nil, jose.JSONWebKey{KeyID: "old", Use: "sig"}, jose.JSONWebKey{KeyID: "new", Use: "sig"})
+	source.set(nil, sigKey("old"), sigKey("new"))
 	clock.Advance(9 * time.Second)
-	if _, err := client.GetSignatureKey(ctx, "new"); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("expected ErrKeyNotFound, got: %v", err)
-	}
+	expectNotFound(t, client, "new")
 
 	clock.Advance(time.Second)
-	if _, err := client.GetSignatureKey(ctx, "new"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	expectKey(t, client, "new")
 }
 
 func TestJWKSClient_MinFetchIntervalDisabled(t *testing.T) {
-	source := newCountingSource()
-	client, _ := newTestClient(source, time.Hour, WithMinFetchInterval(0))
+	for _, interval := range []time.Duration{0, -time.Second} {
+		source := newCountingSource(sigKey("known"))
+		client, _ := newTestClient(source, time.Hour, WithMinFetchInterval(interval))
 
-	for i := 0; i < 3; i++ {
-		if _, err := client.GetSignatureKey(context.Background(), "missing"); !errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("expected ErrKeyNotFound, got: %v", err)
+		for i := 0; i < 3; i++ {
+			expectNotFound(t, client, "missing")
 		}
-	}
-	if calls := source.callCount(); calls != 3 {
-		t.Fatalf("expected 3 requests to the source, got %d", calls)
+		expectCalls(t, source, 3)
+
+		// no pause after a failure either
+		source.set(errors.New("boom"))
+		for i := 0; i < 3; i++ {
+			expectSourceError(t, client, "missing")
+		}
+		expectCalls(t, source, 6)
 	}
 }
 
-// A failed fetch must not be mistaken for a missing key, and must not be
-// remembered.
-func TestJWKSClient_SourceErrorIsNotCached(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "known", Use: "sig"})
+// A failing source must not be asked again on every request, and its failure
+// must not be mistaken for a missing key.
+func TestJWKSClient_FailingSourceIsNotHammered(t *testing.T) {
+	source := newCountingSource()
 	source.set(errors.New("boom"))
-	client, _ := newTestClient(source, time.Hour)
-	ctx := context.Background()
+	client, clock := newTestClient(source, time.Hour)
 
-	if _, err := client.GetSignatureKey(ctx, "known"); err == nil || errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("expected the source error, got: %v", err)
+	for i := 0; i < 100; i++ {
+		expectSourceError(t, client, fmt.Sprintf("random-%d", i))
 	}
+	expectCalls(t, source, 1)
 
-	source.set(nil, jose.JSONWebKey{KeyID: "known", Use: "sig"})
-	if _, err := client.GetSignatureKey(ctx, "known"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	clock.Advance(maxFailureBackoff)
+	for i := 0; i < 100; i++ {
+		expectSourceError(t, client, fmt.Sprintf("random-%d", i))
 	}
+	expectCalls(t, source, 2)
+
+	// the client recovers as soon as the pause is over
+	source.set(nil, sigKey("known"))
+	expectSourceError(t, client, "known")
+	clock.Advance(maxFailureBackoff)
+	expectKey(t, client, "known")
+	expectCalls(t, source, 3)
+}
+
+// An answer without keys is a malfunction of the source, not a revocation of
+// every key.
+func TestJWKSClient_EmptyKeySetIsAnError(t *testing.T) {
+	source := newCountingSource(sigKey("known"))
+	client, clock := newTestClient(source, time.Minute)
+	expectKey(t, client, "known")
+
+	source.set(nil)
+	clock.Advance(time.Hour)
+	expectKey(t, client, "known")
+	expectSourceError(t, client, "other")
+
+	source.set(nil, sigKey("known"))
+	clock.Advance(maxFailureBackoff)
+	expectKey(t, client, "known")
+	expectNotFound(t, client, "other")
+}
+
+func TestJWKSClient_SourceReturningNil(t *testing.T) {
+	client := NewClient(NewDummySource(nil), NewMockCache(), time.Minute)
+	expectSourceError(t, client, "any")
 }
 
 // A key that disappears from the key set stops being served after the next
 // refresh, not after the cache ttl.
 func TestJWKSClient_RevokedKeyIsDropped(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "revoked", Use: "sig"})
-	client, clock := newTestClient(source, time.Minute, WithMinFetchInterval(10*time.Second))
-	ctx := context.Background()
+	source := newCountingSource(sigKey("revoked"), sigKey("other"))
+	client, clock := newTestClient(source, time.Minute)
+	expectKey(t, client, "revoked")
 
-	if _, err := client.GetSignatureKey(ctx, "revoked"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	source.set(nil, sigKey("other"))
+	clock.Advance(time.Minute + time.Second)
 
-	source.set(nil)
-	clock.Advance(2 * time.Minute)
-
-	// the request that triggers the refresh still gets the cached key
-	if _, err := client.GetSignatureKey(ctx, "revoked"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	waitFor(t, "the key to be dropped", func() bool {
-		_, err := client.GetSignatureKey(ctx, "revoked")
-		return errors.Is(err, ErrKeyNotFound)
-	})
+	// the key has just become due: it is served while the key set is
+	// refreshed in the background
+	expectKey(t, client, "revoked")
+	waitForIdle(t, client, source, 2)
+	expectNotFound(t, client, "revoked")
 
 	// a dropped key does not cause a fetch on every request either
-	calls := source.callCount()
 	for i := 0; i < 10; i++ {
-		if _, err := client.GetSignatureKey(ctx, "revoked"); !errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("expected ErrKeyNotFound, got: %v", err)
-		}
+		expectNotFound(t, client, "revoked")
 	}
-	if source.callCount() != calls {
-		t.Fatalf("expected no more requests to the source, got %d", source.callCount()-calls)
-	}
+	expectCalls(t, source, 2)
 
 	// if the key comes back, it is served again
-	source.set(nil, jose.JSONWebKey{KeyID: "revoked", Use: "sig"})
-	clock.Advance(10 * time.Second)
-	if _, err := client.GetSignatureKey(ctx, "revoked"); err != nil {
+	source.set(nil, sigKey("revoked"), sigKey("other"))
+	clock.Advance(DefaultMinFetchInterval)
+	expectKey(t, client, "revoked")
+}
+
+// A revoked key that nobody asked for in a long time must not be served to
+// the requests that arrive before the refresh is done.
+func TestJWKSClient_IdleRevokedKeyIsNotServed(t *testing.T) {
+	source := newCountingSource(sigKey("revoked"), sigKey("other"))
+	client, clock := newTestClient(source, time.Hour)
+	expectKey(t, client, "revoked")
+
+	source.set(nil, sigKey("other"))
+	clock.Advance(11 * time.Hour)
+	block := make(chan struct{})
+	source.setBlock(block)
+
+	const n = 50
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := client.GetSignatureKey(context.Background(), "revoked")
+			errs <- err
+		}()
+	}
+	waitForWaiters(t, client, n)
+	close(block)
+
+	for i := 0; i < n; i++ {
+		if err := <-errs; !errors.Is(err, ErrKeyNotFound) {
+			t.Errorf("expected ErrKeyNotFound, got: %v", err)
+		}
+	}
+	expectCalls(t, source, 2)
+}
+
+// The time a key may be served is counted from when its key set was fetched,
+// not from when the key was last read from it.
+func TestJWKSClient_RefreshIsCountedFromTheFetch(t *testing.T) {
+	source := newCountingSource(sigKey("revoked"), sigKey("other"))
+	client, clock := newTestClient(source, time.Minute)
+	expectKey(t, client, "revoked")
+
+	// the key set is fetched again shortly before the key is due...
+	clock.Advance(55 * time.Second)
+	expectNotFound(t, client, "random")
+	expectCalls(t, source, 2)
+
+	// ...and the key is revoked right after that
+	source.set(nil, sigKey("other"))
+	clock.Advance(6 * time.Second)
+	expectKey(t, client, "revoked")
+	expectCalls(t, source, 2)
+
+	// one refresh interval and the background window after that fetch
+	clock.Advance(time.Minute + backgroundRefreshWindow)
+	expectNotFound(t, client, "revoked")
+	expectCalls(t, source, 3)
+}
+
+// A key set fetched for any reason applies to cached keys right away.
+func TestJWKSClient_NewerKeySetAppliesToCachedKeys(t *testing.T) {
+	source := newCountingSource(sigKey("revoked"), sigKey("kept"))
+	client, clock := newTestClient(source, time.Hour)
+	expectKey(t, client, "revoked")
+	expectKey(t, client, "kept")
+
+	source.set(nil, sigKey("kept"))
+	clock.Advance(DefaultMinFetchInterval)
+	expectNotFound(t, client, "random")
+	expectCalls(t, source, 2)
+
+	// not due for a refresh for another hour
+	expectNotFound(t, client, "revoked")
+	expectKey(t, client, "kept")
+	expectCalls(t, source, 2)
+}
+
+// A key whose "use" changes is not served for the old use.
+func TestJWKSClient_KeyChangingUseIsDropped(t *testing.T) {
+	source := newCountingSource(sigKey("key"))
+	client, clock := newTestClient(source, time.Minute)
+	expectKey(t, client, "key")
+
+	source.set(nil, jose.JSONWebKey{KeyID: "key", Use: "enc"})
+	clock.Advance(time.Hour)
+	expectNotFound(t, client, "key")
+	if _, err := client.GetEncryptionKey(context.Background(), "key"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-// If the source is unavailable, cached keys keep being served.
+// If the source is unavailable, cached keys keep being served, and it is not
+// asked again on every request.
 func TestJWKSClient_CachedKeySurvivesSourceError(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "known", Use: "sig"})
+	source := newCountingSource(sigKey("known"))
 	client, clock := newTestClient(source, time.Minute)
-	ctx := context.Background()
-
-	if _, err := client.GetSignatureKey(ctx, "known"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	expectKey(t, client, "known")
 
 	source.set(errors.New("boom"))
-	clock.Advance(2 * time.Minute)
+	clock.Advance(2 * time.Hour)
 
-	if _, err := client.GetSignatureKey(ctx, "known"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// the first request finds out that the source is down...
+	expectKey(t, client, "known")
+	expectCalls(t, source, 2)
+	// ...and the following ones do not ask it again
+	for i := 0; i < 10; i++ {
+		expectKey(t, client, "known")
 	}
-	waitFor(t, "the failed refresh", func() bool {
-		return source.callCount() == 2 && !client.refreshing.Load()
-	})
-	if _, err := client.GetSignatureKey(ctx, "known"); err != nil {
-		t.Fatalf("the cached key should survive a failed refresh, got: %v", err)
+	expectCalls(t, source, 2)
+
+	// it is retried after a pause, in the background: nobody waits for a
+	// source that is known to be down
+	clock.Advance(maxFailureBackoff)
+	block := make(chan struct{})
+	source.setBlock(block)
+	expectKey(t, client, "known")
+	expectKey(t, client, "known")
+	close(block)
+	source.setBlock(nil)
+	waitForIdle(t, client, source, 3)
+
+	source.set(nil, sigKey("known"))
+	clock.Advance(maxFailureBackoff)
+	expectKey(t, client, "known")
+	waitForIdle(t, client, source, 4)
+	if client.sourceFailing() {
+		t.Fatal("the source should not be considered failing any more")
 	}
+	expectKey(t, client, "known")
+	expectCalls(t, source, 4)
+}
+
+// Revocation works with the default cache as well.
+func TestJWKSClient_RevokedKeyIsDroppedFromDefaultCache(t *testing.T) {
+	source := newCountingSource(sigKey("revoked"), sigKey("other"))
+	client := NewDefaultClient(source, time.Minute, time.Hour).(*jWKSClient)
+	clock := &fakeClock{now: time.Unix(1700000000, 0)}
+	client.now = clock.Now
+	expectKey(t, client, "revoked")
+
+	source.set(nil, sigKey("other"))
+	clock.Advance(10 * time.Minute)
+	expectNotFound(t, client, "revoked")
+	expectNotFound(t, client, "revoked")
+
+	source.set(nil, sigKey("revoked"), sigKey("other"))
+	clock.Advance(DefaultMinFetchInterval)
+	expectKey(t, client, "revoked")
 }
 
 // A caller that gives up must not break the request for the others waiting
 // for it.
 func TestJWKSClient_CancelledCallerDoesNotCancelSharedFetch(t *testing.T) {
-	source := newCountingSource(jose.JSONWebKey{KeyID: "known", Use: "sig"})
+	source := newCountingSource(sigKey("known"))
 	source.block = make(chan struct{})
-	client, _ := newTestClient(source, time.Minute)
+	client, _ := newTestClient(source, time.Minute, WithMinFetchInterval(0))
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	first := make(chan error, 1)
@@ -545,13 +731,14 @@ func TestJWKSClient_CancelledCallerDoesNotCancelSharedFetch(t *testing.T) {
 		_, err := client.GetSignatureKey(ctx1, "known")
 		first <- err
 	}()
-	waitFor(t, "the request to the source", func() bool { return source.callCount() == 1 })
+	waitForWaiters(t, client, 1)
 
 	second := make(chan error, 1)
 	go func() {
 		_, err := client.GetSignatureKey(context.Background(), "known")
 		second <- err
 	}()
+	waitForWaiters(t, client, 2)
 
 	cancel1()
 	if err := <-first; !errors.Is(err, context.Canceled) {
@@ -562,31 +749,96 @@ func TestJWKSClient_CancelledCallerDoesNotCancelSharedFetch(t *testing.T) {
 	if err := <-second; err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if calls := source.callCount(); calls != 1 {
-		t.Fatalf("expected 1 request to the source, got %d", calls)
+	expectCalls(t, source, 1)
+}
+
+func TestJWKSClient_CancelledContextDoesNotFetch(t *testing.T) {
+	source := newCountingSource(sigKey("known"))
+	client, _ := newTestClient(source, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.GetSignatureKey(ctx, "known"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.inflight != nil {
+		t.Fatal("a request to the source should not be started")
 	}
 }
 
-type panickingSource struct{}
+// hangingSource ignores its context and does not answer its first request
+// until released.
+type hangingSource struct {
+	calls   atomic.Int32
+	release chan struct{}
+	jwks    *jose.JSONWebKeySet
+}
 
-func (panickingSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
-	panic("boom")
+func (s *hangingSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	if s.calls.Add(1) == 1 {
+		<-s.release
+	}
+	return s.jwks, nil
+}
+
+// A source that hangs, ignoring its context, must not block the client for
+// good.
+func TestJWKSClient_HangingSourceIsGivenUpOn(t *testing.T) {
+	source := &hangingSource{
+		release: make(chan struct{}),
+		jwks:    &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{sigKey("known")}},
+	}
+	defer close(source.release)
+	client, clock := newTestClient(source, time.Minute)
+	client.fetchTimeout = 20 * time.Millisecond
+
+	// the caller itself is ready to wait much longer than that
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.GetSignatureKey(ctx, "known")
+	if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		t.Fatalf("expected the request to the source to time out, got: %v", err)
+	}
+
+	clock.Advance(maxFailureBackoff)
+	expectKey(t, client, "known")
+	if calls := source.calls.Load(); calls != 2 {
+		t.Fatalf("expected 2 requests to the source, got %d", calls)
+	}
+}
+
+type misbehavingSource struct {
+	behave func()
+}
+
+func (s misbehavingSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	s.behave()
+	return nil, nil
 }
 
 func TestJWKSClient_SourcePanicIsReturnedAsError(t *testing.T) {
-	client := NewClient(panickingSource{}, NewMockCache(), time.Minute)
-
-	for i := 0; i < 2; i++ {
-		if _, err := client.GetSignatureKey(context.Background(), "any"); err == nil || errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("expected the panic as an error, got: %v", err)
+	for name, behave := range map[string]func(){
+		"panic":  func() { panic("boom") },
+		"goexit": runtime.Goexit,
+	} {
+		client := NewClient(misbehavingSource{behave}, NewMockCache(), time.Minute, WithMinFetchInterval(0))
+		for i := 0; i < 2; i++ {
+			if _, err := client.GetSignatureKey(context.Background(), "any"); err == nil || errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("%s: expected an error, got: %v", name, err)
+			}
 		}
 	}
 }
 
-func TestJWKSClient_SourceReturningNil(t *testing.T) {
-	client := NewClient(NewDummySource(nil), NewMockCache(), time.Minute)
+// The source may go on using the key set it returned.
+func TestJWKSClient_KeySetIsCopied(t *testing.T) {
+	keySet := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{sigKey("known")}}
+	client, _ := newTestClient(NewDummySource(keySet), time.Minute)
+	expectNotFound(t, client, "changed")
 
-	if _, err := client.GetSignatureKey(context.Background(), "any"); err == nil || errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("expected an error, got: %v", err)
-	}
+	keySet.Keys[0].KeyID = "changed"
+	expectNotFound(t, client, "changed")
+	expectKey(t, client, "known")
 }
