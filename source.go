@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -105,16 +106,17 @@ func (s *WebSource) tooLarge() error {
 	return fmt.Errorf("invalid JWKS from %s: larger than %d bytes", s.jwksUri, MaxResponseSize)
 }
 
-// parseKeys returns the keys that can be parsed, and an error for each one
-// that cannot. Such keys are to be ignored (RFC 7517, section 5): a key set
-// may well contain keys of a type, curve or size that is not supported here,
-// next to the ones that are needed.
+// parseKeys returns the keys that can be used, and an error for each one
+// that cannot: a key that cannot be parsed, or that is not a public key.
+// Keys that cannot be parsed are to be ignored (RFC 7517, section 5): a key
+// set may well contain keys of a type, curve or size that is not supported
+// here, next to the ones that are needed.
 func parseKeys(rawKeys []json.RawMessage) (*jose.JSONWebKeySet, []error) {
 	keySet := &jose.JSONWebKeySet{Keys: make([]jose.JSONWebKey, 0, len(rawKeys))}
 	var skipped []error
 	for _, rawKey := range rawKeys {
-		var key jose.JSONWebKey
-		if err := json.Unmarshal(rawKey, &key); err != nil {
+		key, err := parseKey(rawKey)
+		if err != nil {
 			// best effort, to tell which key it was
 			var id struct {
 				Kid string `json:"kid"`
@@ -127,6 +129,24 @@ func parseKeys(rawKeys []json.RawMessage) (*jose.JSONWebKeySet, []error) {
 		keySet.Keys = append(keySet.Keys, key)
 	}
 	return keySet, skipped
+}
+
+// errNotPublicKey is why a private or a symmetric key is skipped.
+var errNotPublicKey = errors.New("not a public key")
+
+func parseKey(rawKey json.RawMessage) (jose.JSONWebKey, error) {
+	var key jose.JSONWebKey
+	if err := json.Unmarshal(rawKey, &key); err != nil {
+		return key, err
+	}
+	// A key set is fetched to check what others have signed, or to encrypt
+	// for them, and both take a public key. A private or a symmetric key
+	// that is published in a key set is no secret any more, so anyone can
+	// sign with it: it must not be used to verify anything.
+	if !key.IsPublic() {
+		return key, errNotPublicKey
+	}
+	return key, nil
 }
 
 // skippedReport returns what to log about the keys that were skipped. It is

@@ -155,7 +155,25 @@ func (c *jWKSClient) GetEncryptionKey(ctx context.Context, keyId string) (*jose.
 // "use" is not returned. An empty use matches any key.
 //
 // If there is no such key, the error wraps ErrKeyNotFound.
+//
+// The returned JSONWebKey is the caller's own: changing its fields does not
+// affect the key that other callers get. What it refers to (the key in Key,
+// the certificates) is shared and must not be modified.
 func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
+	jwk, err := c.getKey(ctx, keyId, use)
+	if err != nil {
+		return nil, err
+	}
+	// The key lives in the cache and is handed to every caller: give each
+	// one a copy, so that none of them can change it for the others.
+	own := *jwk
+	own.Certificates = slices.Clone(jwk.Certificates)
+	own.CertificateThumbprintSHA1 = slices.Clone(jwk.CertificateThumbprintSHA1)
+	own.CertificateThumbprintSHA256 = slices.Clone(jwk.CertificateThumbprintSHA256)
+	return &own, nil
+}
+
+func (c *jWKSClient) getKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
 	val, found := c.cache.Get(cacheKey(keyId, use))
 	if !found {
 		return c.loadKey(ctx, keyId, use)

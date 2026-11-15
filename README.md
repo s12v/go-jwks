@@ -65,6 +65,9 @@ for example, `GetSignatureKey` fails for a key marked `"use": "enc"`.
 The library does not check the key type or algorithm: verify them against what you expect,
 e.g. by passing the allowed algorithms to `jose.ParseSigned`.
 
+The returned key is your own copy: changing its fields does not affect what other callers get.
+What it refers to (the key in `Key`, the certificates) is shared and must not be modified.
+
 ## Caching
 
 ### Key refresh and TTL
@@ -154,9 +157,13 @@ type JWKSSource interface {
 ```
 
 `WebSource` skips the keys it cannot parse (an unknown key type or curve, missing parameters and so on),
-so that one such key does not make the rest of the key set unavailable. Skipped keys are logged
-(the first five of them by name).
-If no key can be parsed, the request fails.
+so that one such key does not make the rest of the key set unavailable.
+
+It also skips private and symmetric keys. A key set is public, so such a key is known to everyone
+and anyone could sign with it; only public keys are served. If you do keep private or symmetric keys
+in a key set of your own, provide your own source.
+
+Skipped keys are logged (the first five of them by name). If no key is left, the request fails.
 
 A response larger than 1 MiB (`MaxResponseSize`) is rejected without being read in full.
 The limit applies to the response after decompression. It cannot be changed; if your key set is larger,
