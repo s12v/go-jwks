@@ -1,8 +1,10 @@
 package jwks
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,5 +251,68 @@ func TestWebSource_EndlessResponse(t *testing.T) {
 	// the connection is dropped long before the server is done
 	if n := <-sent; n >= 64<<20 {
 		t.Fatalf("the whole response was read: %d bytes", n)
+	}
+}
+
+// A response that declares its size is rejected without being read.
+func TestWebSource_DeclaredSizeOverLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(MaxResponseSize+1))
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer srv.Close()
+
+	if _, err := NewWebSource(srv.URL, nil).JSONWebKeySet(context.Background()); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("expected a size error, got: %v", err)
+	}
+}
+
+// The limit applies to the response as it is held in memory, not as it is
+// sent: a small compressed response can expand into a huge one.
+func TestWebSource_CompressedResponse(t *testing.T) {
+	padding := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			t.Errorf("expected the client to accept gzip")
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		compressed := gzip.NewWriter(w)
+		defer compressed.Close()
+		_, _ = compressed.Write([]byte(`{"keys":[` + testRSAKey + `],"padding":"` + strings.Repeat("a", padding) + `"}`))
+	}))
+	defer srv.Close()
+	source := NewWebSource(srv.URL, nil)
+
+	jwks, err := source.JSONWebKeySet(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jwks.Keys) != 1 {
+		t.Fatalf("unexpected keys: %+v", jwks.Keys)
+	}
+
+	padding = 4 * MaxResponseSize
+	if _, err = source.JSONWebKeySet(context.Background()); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("expected a size error, got: %v", err)
+	}
+}
+
+// The report about skipped keys stays short, whatever the key set holds.
+func TestWebSource_SkippedReportIsBounded(t *testing.T) {
+	longKid := strings.Repeat("k", 10000)
+	keys := []string{testRSAKey}
+	for i := 0; i < 99; i++ {
+		keys = append(keys, fmt.Sprintf(`{"kty":"OKP","crv":"Ed448","kid":"%s-%d","x":"AAAA"}`, longKid, i))
+	}
+	body := `{"keys":[` + strings.Join(keys, ",") + `]}`
+	source := serveJWKS(t, &body)
+	if _, err := source.JSONWebKeySet(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if len(source.lastSkipped) > 2000 || !strings.Contains(source.lastSkipped, "and 94 more") {
+		t.Fatalf("unexpected report of %d bytes: %.300s", len(source.lastSkipped), source.lastSkipped)
 	}
 }

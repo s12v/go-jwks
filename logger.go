@@ -28,6 +28,12 @@ func SetLogger(l jwksLogger) {
 }
 
 func logf(format string, v ...interface{}) {
+	// A logger must not be able to take the client down. Messages are
+	// logged from goroutines of this package, where a panic (of a broken
+	// logger, or of a nil pointer passed to SetLogger as a logger) could
+	// not be recovered by the application.
+	defer func() { _ = recover() }()
+
 	l := logger.Load()
 	if l == nil {
 		defaultLogger{}.Printf(format, v...)

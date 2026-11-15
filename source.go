@@ -22,6 +22,9 @@ const DefaultHTTPTimeout = 10 * time.Second
 // A key takes a few kilobytes at most, even with a certificate chain.
 const MaxResponseSize = 1 << 20
 
+// maxSkippedReported is how many skipped keys are named in the log.
+const maxSkippedReported = 5
+
 type JWKSSource interface {
 	JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error)
 }
@@ -64,6 +67,9 @@ func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, err
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed request to %s, status: %d", s.jwksUri, resp.StatusCode)
 	}
+	if resp.ContentLength > MaxResponseSize {
+		return nil, s.tooLarge()
+	}
 
 	// Read no more than the limit, whatever the server sends: the response
 	// is held in memory in full.
@@ -72,7 +78,7 @@ func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, err
 		return nil, fmt.Errorf("failed to read JWKS from %s: %w", s.jwksUri, err)
 	}
 	if len(body) > MaxResponseSize {
-		return nil, fmt.Errorf("invalid JWKS from %s: larger than %d bytes", s.jwksUri, MaxResponseSize)
+		return nil, s.tooLarge()
 	}
 
 	// The keys are parsed one by one: a key that cannot be parsed must not
@@ -95,6 +101,10 @@ func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, err
 	return jsonWebKeySet, nil
 }
 
+func (s *WebSource) tooLarge() error {
+	return fmt.Errorf("invalid JWKS from %s: larger than %d bytes", s.jwksUri, MaxResponseSize)
+}
+
 // parseKeys returns the keys that can be parsed, and an error for each one
 // that cannot. Such keys are to be ignored (RFC 7517, section 5): a key set
 // may well contain keys of a type, curve or size that is not supported here,
@@ -111,7 +121,7 @@ func parseKeys(rawKeys []json.RawMessage) (*jose.JSONWebKeySet, []error) {
 				Kty string `json:"kty"`
 			}
 			_ = json.Unmarshal(rawKey, &id)
-			skipped = append(skipped, fmt.Errorf("key %q of type %q: %w", id.Kid, id.Kty, err))
+			skipped = append(skipped, fmt.Errorf("key %s of type %s: %w", quoteUntrusted(id.Kid), quoteUntrusted(id.Kty), err))
 			continue
 		}
 		keySet.Keys = append(keySet.Keys, key)
@@ -125,9 +135,13 @@ func parseKeys(rawKeys []json.RawMessage) (*jose.JSONWebKeySet, []error) {
 func (s *WebSource) skippedReport(skipped []error, total int) string {
 	var report string
 	if len(skipped) > 0 {
-		reasons := make([]string, len(skipped))
-		for i, err := range skipped {
-			reasons[i] = err.Error()
+		// a key set can hold any number of such keys: name the first few
+		reasons := make([]string, 0, maxSkippedReported+1)
+		for _, err := range skipped[:min(len(skipped), maxSkippedReported)] {
+			reasons = append(reasons, err.Error())
+		}
+		if more := len(skipped) - maxSkippedReported; more > 0 {
+			reasons = append(reasons, fmt.Sprintf("and %d more", more))
 		}
 		report = fmt.Sprintf("skipped %d of %d keys in JWKS from %s: %s",
 			len(skipped), total, s.jwksUri, strings.Join(reasons, "; "))

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-jose/go-jose/v4"
 )
@@ -379,7 +380,7 @@ func (c *jWKSClient) querySource(ctx context.Context) (*jose.JSONWebKeySet, erro
 func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWebKey, error) {
 	keys := keySet.Key(keyId)
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, quoteKeyId(keyId))
+		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, quoteUntrusted(keyId))
 	}
 
 	// Prefer a key with the requested "use"; fall back to a key without
@@ -403,20 +404,30 @@ func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWe
 		// no particular use requested
 		return &keys[0], nil
 	}
-	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, quoteKeyId(keyId), use)
+	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, quoteUntrusted(keyId), quoteUntrusted(use))
 }
 
-// maxKeyIdInError is how much of a key id is quoted in an error message.
-const maxKeyIdInError = 100
+// maxUntrustedLen is how much of an untrusted value is quoted in a message.
+const maxUntrustedLen = 100
 
-// quoteKeyId makes a key id safe to put into an error message. Key ids come
-// from tokens that are not verified yet and errors tend to end up in logs,
-// so an id must not be able to break out of its line or to flood the log.
-func quoteKeyId(keyId string) string {
-	if len(keyId) > maxKeyIdInError {
-		return strconv.Quote(keyId[:maxKeyIdInError]) + "..."
+// quoteUntrusted makes a value that this process does not control, such as a
+// key id, safe to put into an error or a log message. Key ids come from
+// tokens that are not verified yet and errors tend to end up in logs, so a
+// value must not be able to break out of its line or to flood the log.
+//
+// The value is cut to maxUntrustedLen bytes and then quoted; quoting escapes
+// control and non-printable characters, so the result can be several times
+// longer than that, but it is bounded.
+func quoteUntrusted(value string) string {
+	if len(value) <= maxUntrustedLen {
+		return strconv.Quote(value)
 	}
-	return strconv.Quote(keyId)
+	// do not cut a character in half
+	cut := maxUntrustedLen
+	for i := 0; i < utf8.UTFMax-1 && !utf8.RuneStart(value[cut]); i++ {
+		cut--
+	}
+	return strconv.Quote(value[:cut]) + "..."
 }
 
 // cacheKey makes cache entries specific to the requested use, so that a key
