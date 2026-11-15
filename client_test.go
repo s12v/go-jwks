@@ -2,6 +2,8 @@ package jwks
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"runtime"
@@ -895,4 +897,112 @@ func TestQuoteUntrusted(t *testing.T) {
 			t.Errorf("quoteUntrusted(%q) = %s, expected %s", value, quoted, expected)
 		}
 	}
+}
+
+// certifiedKey is a key with everything a key can carry.
+func certifiedKey() jose.JSONWebKey {
+	return jose.JSONWebKey{
+		Key:                         ed25519.PublicKey(make([]byte, ed25519.PublicKeySize)),
+		KeyID:                       "key",
+		Algorithm:                   "EdDSA",
+		Use:                         "sig",
+		Certificates:                []*x509.Certificate{{Raw: []byte("certificate")}},
+		CertificateThumbprintSHA1:   []byte("sha1"),
+		CertificateThumbprintSHA256: []byte("sha256"),
+	}
+}
+
+func expectCertifiedKey(t *testing.T, jwk *jose.JSONWebKey) {
+	t.Helper()
+	expected := certifiedKey()
+	if jwk.KeyID != expected.KeyID || jwk.Algorithm != expected.Algorithm || jwk.Use != expected.Use {
+		t.Fatalf("unexpected key: %+v", jwk)
+	}
+	if key, ok := jwk.Key.(ed25519.PublicKey); !ok || len(key) != ed25519.PublicKeySize {
+		t.Fatalf("unexpected key material: %T", jwk.Key)
+	}
+	if len(jwk.Certificates) != 1 || jwk.Certificates[0] == nil || string(jwk.Certificates[0].Raw) != "certificate" {
+		t.Fatalf("unexpected certificates: %+v", jwk.Certificates)
+	}
+	if string(jwk.CertificateThumbprintSHA1) != "sha1" || string(jwk.CertificateThumbprintSHA256) != "sha256" {
+		t.Fatalf("unexpected thumbprints: %q, %q", jwk.CertificateThumbprintSHA1, jwk.CertificateThumbprintSHA256)
+	}
+}
+
+// Whatever a caller does to the key it got must not reach the other callers.
+func TestJWKSClient_ReturnedKeyIsACopy(t *testing.T) {
+	client, clock := newTestClient(newCountingSource(certifiedKey()), time.Minute)
+	ctx := context.Background()
+
+	spoil := func(jwk *jose.JSONWebKey) {
+		jwk.Key = nil
+		jwk.KeyID = "other"
+		jwk.Algorithm = "none"
+		jwk.Use = "enc"
+		jwk.Certificates[0] = nil
+		jwk.CertificateThumbprintSHA1[0] = 'x'
+		jwk.CertificateThumbprintSHA256[0] = 'x'
+	}
+
+	// fetched from the source
+	first, err := client.GetSignatureKey(ctx, "key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectCertifiedKey(t, first)
+	spoil(first)
+
+	// served from the cache
+	second, err := client.GetSignatureKey(ctx, "key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if second == first {
+		t.Fatal("expected another copy of the key")
+	}
+	expectCertifiedKey(t, second)
+	spoil(second)
+
+	// read again from a newer key set
+	clock.Advance(time.Hour)
+	third, err := client.GetSignatureKey(ctx, "key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectCertifiedKey(t, third)
+	spoil(third)
+
+	fourth, err := client.GetSignatureKey(ctx, "key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectCertifiedKey(t, fourth)
+}
+
+// Callers may change their keys at the same time.
+func TestJWKSClient_ReturnedKeysAreIndependent(t *testing.T) {
+	client, _ := newTestClient(newCountingSource(certifiedKey()), time.Minute)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				jwk, err := client.GetSignatureKey(context.Background(), "key")
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				if jwk.Algorithm != "EdDSA" || string(jwk.CertificateThumbprintSHA1) != "sha1" {
+					t.Errorf("unexpected key: %+v", jwk)
+					return
+				}
+				jwk.Algorithm = "none"
+				jwk.CertificateThumbprintSHA1[0] = 'x'
+				jwk.Certificates[0] = nil
+			}
+		}()
+	}
+	wg.Wait()
 }

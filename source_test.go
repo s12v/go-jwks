@@ -3,6 +3,12 @@ package jwks
 import (
 	"compress/gzip"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,7 +20,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 )
 
-const testJWKS = `{"keys":[{"kty":"oct","kid":"key1","use":"sig","k":"c2VjcmV0"}]}`
+const testJWKS = `{"keys":[` + testRSAKey + `]}`
 
 func TestWebSource_JSONWebKeySet(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +36,7 @@ func TestWebSource_JSONWebKeySet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(jwks.Keys) != 1 || jwks.Keys[0].KeyID != "key1" {
+	if len(jwks.Keys) != 1 || jwks.Keys[0].KeyID != "rsa1" {
 		t.Fatalf("unexpected key set: %+v", jwks)
 	}
 }
@@ -314,5 +320,104 @@ func TestWebSource_SkippedReportIsBounded(t *testing.T) {
 	defer source.mu.Unlock()
 	if len(source.lastSkipped) > 2000 || !strings.Contains(source.lastSkipped, "and 94 more") {
 		t.Fatalf("unexpected report of %d bytes: %.300s", len(source.lastSkipped), source.lastSkipped)
+	}
+}
+
+// marshalKey returns the key as it would be published in a key set.
+func marshalKey(t *testing.T, keyId string, key interface{}) string {
+	t.Helper()
+	data, err := json.Marshal(jose.JSONWebKey{Key: key, KeyID: keyId, Use: "sig"})
+	if err != nil {
+		t.Fatalf("unable to marshal the %s key: %v", keyId, err)
+	}
+	return string(data)
+}
+
+// testKeyPairs returns a private and a public key of each supported type,
+// and a symmetric key, by key id.
+func testKeyPairs(t *testing.T) (private map[string]string, public map[string]string) {
+	t.Helper()
+	// the size does not matter here, and a small key is quick to generate
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edPublic, edPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	private = map[string]string{
+		"rsa-private": marshalKey(t, "rsa-private", rsaKey),
+		"ec-private":  marshalKey(t, "ec-private", ecKey),
+		"ed-private":  marshalKey(t, "ed-private", edPrivate),
+		"symmetric":   marshalKey(t, "symmetric", []byte("a secret that is not one any more")),
+	}
+	public = map[string]string{
+		"rsa-public": marshalKey(t, "rsa-public", &rsaKey.PublicKey),
+		"ec-public":  marshalKey(t, "ec-public", &ecKey.PublicKey),
+		"ed-public":  marshalKey(t, "ed-public", edPublic),
+	}
+	return private, public
+}
+
+// A private or a symmetric key that is published in a key set is known to
+// everyone, so it must not be handed out to verify anything.
+func TestWebSource_NonPublicKeyIsSkipped(t *testing.T) {
+	private, public := testKeyPairs(t)
+
+	for keyId, key := range private {
+		t.Run(keyId, func(t *testing.T) {
+			body := `{"keys":[` + key + `,` + testRSAKey + `]}`
+			source := serveJWKS(t, &body)
+
+			jwks, err := source.JSONWebKeySet(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(jwks.Keys) != 1 || jwks.Keys[0].KeyID != "rsa1" {
+				t.Fatalf("expected only the public key, got: %+v", jwks.Keys)
+			}
+
+			source.mu.Lock()
+			report := source.lastSkipped
+			source.mu.Unlock()
+			if !strings.Contains(report, `key "`+keyId+`"`) || !strings.Contains(report, "not a public key") {
+				t.Fatalf("unexpected report: %q", report)
+			}
+
+			// the client does not serve it either
+			client := NewDefaultClient(source, time.Minute, time.Hour)
+			if _, err = client.GetSignatureKey(context.Background(), keyId); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("expected ErrKeyNotFound, got: %v", err)
+			}
+			if _, err = client.GetSignatureKey(context.Background(), "rsa1"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// a key set with nothing else is of no use
+			body = `{"keys":[` + key + `]}`
+			if _, err = source.JSONWebKeySet(context.Background()); !errors.Is(err, errNotPublicKey) {
+				t.Fatalf("expected errNotPublicKey, got: %v", err)
+			}
+		})
+	}
+
+	// public keys of the same types are served
+	for keyId, key := range public {
+		t.Run(keyId, func(t *testing.T) {
+			body := `{"keys":[` + key + `]}`
+			client := NewDefaultClient(serveJWKS(t, &body), time.Minute, time.Hour)
+			jwk, err := client.GetSignatureKey(context.Background(), keyId)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !jwk.IsPublic() || !jwk.Valid() {
+				t.Fatalf("expected a valid public key, got %T", jwk.Key)
+			}
+		})
 	}
 }
