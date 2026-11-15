@@ -62,11 +62,12 @@ or, if there is none, a key with no `use` at all. A key that declares a differen
 for example, `GetSignatureKey` fails for a key marked `"use": "enc"`.
 `GetKey` with an empty `use` returns any key with the given id.
 
-The library does not check the key type or algorithm: verify them against what you expect,
-e.g. by passing the allowed algorithms to `jose.ParseSigned`.
+The library does not check the algorithm, or that the key is of the type the algorithm needs:
+verify them against what you expect, e.g. by passing the allowed algorithms to `jose.ParseSigned`.
 
-The returned key is your own copy: changing its fields does not affect what other callers get.
-What it refers to (the key in `Key`, the certificates) is shared and must not be modified.
+The returned key is your own copy: changing its fields, or the contents of its slices, does not affect
+what other callers get. What it points to is shared and must not be modified: an RSA or EC key in `Key`,
+the certificates in `Certificates`, and `CertificatesURL`.
 
 ## Caching
 
@@ -156,12 +157,16 @@ type JWKSSource interface {
 }
 ```
 
+The client serves the keys a source returns as they are. A source that takes the key set from somewhere
+it does not control should leave out the keys that are not public, like `WebSource` does.
+
 `WebSource` skips the keys it cannot parse (an unknown key type or curve, missing parameters and so on),
 so that one such key does not make the rest of the key set unavailable.
 
-It also skips private and symmetric keys. A key set is public, so such a key is known to everyone
-and anyone could sign with it; only public keys are served. If you do keep private or symmetric keys
-in a key set of your own, provide your own source.
+It also skips keys that come with private or symmetric key material: private keys, symmetric (`oct`) keys,
+and RSA keys published together with their prime factors. A key set is public, so such a key is known
+to everyone and anyone could sign with it; only public keys are served. If you do keep private or
+symmetric keys in a key set of your own, provide your own source.
 
 Skipped keys are logged (the first five of them by name). If no key is left, the request fails.
 

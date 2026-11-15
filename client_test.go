@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -918,8 +919,8 @@ func expectCertifiedKey(t *testing.T, jwk *jose.JSONWebKey) {
 	if jwk.KeyID != expected.KeyID || jwk.Algorithm != expected.Algorithm || jwk.Use != expected.Use {
 		t.Fatalf("unexpected key: %+v", jwk)
 	}
-	if key, ok := jwk.Key.(ed25519.PublicKey); !ok || len(key) != ed25519.PublicKeySize {
-		t.Fatalf("unexpected key material: %T", jwk.Key)
+	if key, ok := jwk.Key.(ed25519.PublicKey); !ok || !key.Equal(expected.Key.(ed25519.PublicKey)) {
+		t.Fatalf("unexpected key material: %v", jwk.Key)
 	}
 	if len(jwk.Certificates) != 1 || jwk.Certificates[0] == nil || string(jwk.Certificates[0].Raw) != "certificate" {
 		t.Fatalf("unexpected certificates: %+v", jwk.Certificates)
@@ -929,12 +930,28 @@ func expectCertifiedKey(t *testing.T, jwk *jose.JSONWebKey) {
 	}
 }
 
-// Whatever a caller does to the key it got must not reach the other callers.
+// Whatever a caller does to the key it got must not reach the other callers,
+// however the key was obtained.
 func TestJWKSClient_ReturnedKeyIsACopy(t *testing.T) {
-	client, clock := newTestClient(newCountingSource(certifiedKey()), time.Minute)
+	source := newCountingSource(certifiedKey())
+	client, clock := newTestClient(source, time.Minute)
 	ctx := context.Background()
 
-	spoil := func(jwk *jose.JSONWebKey) {
+	var previous *jose.JSONWebKey
+	// get returns the key, expects it to be intact, and spoils it
+	get := func(step string) {
+		t.Helper()
+		jwk, err := client.GetSignatureKey(ctx, "key")
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", step, err)
+		}
+		if jwk == previous {
+			t.Fatalf("%s: expected another copy of the key", step)
+		}
+		previous = jwk
+		expectCertifiedKey(t, jwk)
+
+		jwk.Key.(ed25519.PublicKey)[0] ^= 0xff
 		jwk.Key = nil
 		jwk.KeyID = "other"
 		jwk.Algorithm = "none"
@@ -944,39 +961,59 @@ func TestJWKSClient_ReturnedKeyIsACopy(t *testing.T) {
 		jwk.CertificateThumbprintSHA256[0] = 'x'
 	}
 
-	// fetched from the source
-	first, err := client.GetSignatureKey(ctx, "key")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expectCertifiedKey(t, first)
-	spoil(first)
+	get("fetched from the source")
+	get("served from the cache")
 
-	// served from the cache
-	second, err := client.GetSignatureKey(ctx, "key")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if second == first {
-		t.Fatal("expected another copy of the key")
-	}
-	expectCertifiedKey(t, second)
-	spoil(second)
+	clock.Advance(time.Minute + time.Second)
+	get("served while the key set is refreshed in the background")
+	waitForIdle(t, client, source, 2)
+	get("read again from the newer key set")
 
-	// read again from a newer key set
 	clock.Advance(time.Hour)
-	third, err := client.GetSignatureKey(ctx, "key")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expectCertifiedKey(t, third)
-	spoil(third)
+	get("fetched again after a long time")
+	expectCalls(t, source, 3)
 
-	fourth, err := client.GetSignatureKey(ctx, "key")
+	source.set(errors.New("boom"))
+	clock.Advance(time.Hour)
+	get("served from the cache when the source fails")
+	expectCalls(t, source, 4)
+	get("served from the cache while the source is known to fail")
+}
+
+// A key that is a slice is copied as well.
+func TestJWKSClient_ReturnedKeyMaterialIsACopy(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	expectCertifiedKey(t, fourth)
+	// the source keeps the slice it is given, so compare with a copy
+	original := slices.Clone(privateKey)
+	for name, material := range map[string]interface{}{
+		"ed25519 private": privateKey,
+		"symmetric":       []byte("secret"),
+	} {
+		client, _ := newTestClient(newCountingSource(jose.JSONWebKey{KeyID: "key", Key: material}), time.Minute)
+		for i := 0; i < 2; i++ {
+			jwk, err := client.GetSignatureKey(context.Background(), "key")
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", name, err)
+			}
+			switch key := jwk.Key.(type) {
+			case ed25519.PrivateKey:
+				if !key.Equal(original) {
+					t.Fatalf("%s: the key was changed", name)
+				}
+				key[0] ^= 0xff
+			case []byte:
+				if string(key) != "secret" {
+					t.Fatalf("%s: the key was changed", name)
+				}
+				key[0] ^= 0xff
+			default:
+				t.Fatalf("%s: unexpected key %T", name, jwk.Key)
+			}
+		}
+	}
 }
 
 // Callers may change their keys at the same time.
