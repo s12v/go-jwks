@@ -150,6 +150,10 @@ type JWKSSource interface {
 }
 ```
 
+`WebSource` skips the keys it cannot parse (an unknown key type or curve, missing parameters and so on),
+so that one such key does not make the rest of the key set unavailable. Skipped keys are logged.
+If no key can be parsed, the request fails.
+
 ## Logging
 
 Failed requests to the source and keys dropped from the cache are logged with the standard `log` package by default.
