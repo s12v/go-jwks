@@ -17,7 +17,6 @@ Requires Go 1.24 or newer.
 ## Dependencies
 
  * [`github.com/go-jose/go-jose/v4`](https://github.com/go-jose/go-jose) - JWK types
- * [`github.com/patrickmn/go-cache`](https://github.com/patrickmn/go-cache) - default in-memory cache
 
 ## Example
 
@@ -156,7 +155,8 @@ Any other error means that the key set could not be loaded, or that the caller's
 
 ### Cache implementations
 
-Default cache is `github.com/patrickmn/go-cache` in-memory cache.
+The default cache keeps the keys in memory. A key that has expired is no longer served and is removed
+from memory some time later, within another `ttl` if the cache is in use.
 You can provide your own cache implementation, see `cache.go`:
 
 ```go
