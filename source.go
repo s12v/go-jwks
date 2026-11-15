@@ -1,9 +1,11 @@
 package jwks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +17,10 @@ import (
 // DefaultHTTPTimeout is the timeout of the http.Client created by NewWebSource
 // when no client is given.
 const DefaultHTTPTimeout = 10 * time.Second
+
+// MaxResponseSize is the largest key set, in bytes, that WebSource accepts.
+// A key takes a few kilobytes at most, even with a certificate chain.
+const MaxResponseSize = 1 << 20
 
 type JWKSSource interface {
 	JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error)
@@ -59,12 +65,22 @@ func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, err
 		return nil, fmt.Errorf("failed request to %s, status: %d", s.jwksUri, resp.StatusCode)
 	}
 
+	// Read no more than the limit, whatever the server sends: the response
+	// is held in memory in full.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read JWKS from %s: %w", s.jwksUri, err)
+	}
+	if len(body) > MaxResponseSize {
+		return nil, fmt.Errorf("invalid JWKS from %s: larger than %d bytes", s.jwksUri, MaxResponseSize)
+	}
+
 	// The keys are parsed one by one: a key that cannot be parsed must not
 	// make the rest of the key set unusable.
 	var raw struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
-	if err = json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err = json.NewDecoder(bytes.NewReader(body)).Decode(&raw); err != nil {
 		return nil, fmt.Errorf("invalid JWKS from %s: %w", s.jwksUri, err)
 	}
 
@@ -73,7 +89,7 @@ func (s *WebSource) JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, err
 		return nil, fmt.Errorf("invalid JWKS from %s: none of the %d keys can be used: %w", s.jwksUri, len(skipped), skipped[0])
 	}
 	if report := s.skippedReport(skipped, len(raw.Keys)); report != "" {
-		logger.Printf("%s", report)
+		logf("%s", report)
 	}
 
 	return jsonWebKeySet, nil

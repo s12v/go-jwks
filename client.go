@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -252,7 +253,7 @@ func (c *jWKSClient) readKey(snapshot *keySetSnapshot, keyId string, use string)
 // drop removes a cached key that is no longer in the key set.
 func (c *jWKSClient) drop(keyId string, use string, reason error) {
 	c.cache.Set(cacheKey(keyId, use), &cacheEntry{})
-	logger.Printf("key removed from cache: %v", reason)
+	logf("key removed from cache: %v", reason)
 }
 
 // loadKeySet returns the key set fetched within the last minFetchInterval,
@@ -329,7 +330,7 @@ func (c *jWKSClient) fetch(ctx context.Context, call *fetchCall) {
 	close(call.done)
 
 	if err != nil {
-		logger.Printf("unable to fetch JWKS: %v", err)
+		logf("unable to fetch JWKS: %v", err)
 	}
 }
 
@@ -378,7 +379,7 @@ func (c *jWKSClient) querySource(ctx context.Context) (*jose.JSONWebKeySet, erro
 func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWebKey, error) {
 	keys := keySet.Key(keyId)
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keyId)
+		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, quoteKeyId(keyId))
 	}
 
 	// Prefer a key with the requested "use"; fall back to a key without
@@ -402,7 +403,20 @@ func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWe
 		// no particular use requested
 		return &keys[0], nil
 	}
-	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, keyId, use)
+	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, quoteKeyId(keyId), use)
+}
+
+// maxKeyIdInError is how much of a key id is quoted in an error message.
+const maxKeyIdInError = 100
+
+// quoteKeyId makes a key id safe to put into an error message. Key ids come
+// from tokens that are not verified yet and errors tend to end up in logs,
+// so an id must not be able to break out of its line or to flood the log.
+func quoteKeyId(keyId string) string {
+	if len(keyId) > maxKeyIdInError {
+		return strconv.Quote(keyId[:maxKeyIdInError]) + "..."
+	}
+	return strconv.Quote(keyId)
 }
 
 // cacheKey makes cache entries specific to the requested use, so that a key
