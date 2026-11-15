@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-jose/go-jose/v4"
 )
@@ -252,7 +254,7 @@ func (c *jWKSClient) readKey(snapshot *keySetSnapshot, keyId string, use string)
 // drop removes a cached key that is no longer in the key set.
 func (c *jWKSClient) drop(keyId string, use string, reason error) {
 	c.cache.Set(cacheKey(keyId, use), &cacheEntry{})
-	logger.Printf("key removed from cache: %v", reason)
+	logf("key removed from cache: %v", reason)
 }
 
 // loadKeySet returns the key set fetched within the last minFetchInterval,
@@ -329,7 +331,7 @@ func (c *jWKSClient) fetch(ctx context.Context, call *fetchCall) {
 	close(call.done)
 
 	if err != nil {
-		logger.Printf("unable to fetch JWKS: %v", err)
+		logf("unable to fetch JWKS: %v", err)
 	}
 }
 
@@ -378,7 +380,7 @@ func (c *jWKSClient) querySource(ctx context.Context) (*jose.JSONWebKeySet, erro
 func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWebKey, error) {
 	keys := keySet.Key(keyId)
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keyId)
+		return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, quoteUntrusted(keyId))
 	}
 
 	// Prefer a key with the requested "use"; fall back to a key without
@@ -402,7 +404,30 @@ func findKey(keySet *jose.JSONWebKeySet, keyId string, use string) (*jose.JSONWe
 		// no particular use requested
 		return &keys[0], nil
 	}
-	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, keyId, use)
+	return nil, fmt.Errorf("%w: %s, use: %s", ErrKeyNotFound, quoteUntrusted(keyId), quoteUntrusted(use))
+}
+
+// maxUntrustedLen is how much of an untrusted value is quoted in a message.
+const maxUntrustedLen = 100
+
+// quoteUntrusted makes a value that this process does not control, such as a
+// key id, safe to put into an error or a log message. Key ids come from
+// tokens that are not verified yet and errors tend to end up in logs, so a
+// value must not be able to break out of its line or to flood the log.
+//
+// The value is cut to maxUntrustedLen bytes and then quoted; quoting escapes
+// control and non-printable characters, so the result can be several times
+// longer than that, but it is bounded.
+func quoteUntrusted(value string) string {
+	if len(value) <= maxUntrustedLen {
+		return strconv.Quote(value)
+	}
+	// do not cut a character in half
+	cut := maxUntrustedLen
+	for i := 0; i < utf8.UTFMax-1 && !utf8.RuneStart(value[cut]); i++ {
+		cut--
+	}
+	return strconv.Quote(value[:cut]) + "..."
 }
 
 // cacheKey makes cache entries specific to the requested use, so that a key

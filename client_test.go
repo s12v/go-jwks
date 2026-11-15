@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -841,4 +842,57 @@ func TestJWKSClient_KeySetIsCopied(t *testing.T) {
 	keySet.Keys[0].KeyID = "changed"
 	expectNotFound(t, client, "changed")
 	expectKey(t, client, "known")
+}
+
+// A key id comes from an unverified token and must not be able to forge log
+// lines or to flood the log through the error message.
+func TestJWKSClient_KeyIdInErrorIsQuoted(t *testing.T) {
+	client, _ := newTestClient(newCountingSource(sigKey("known")), time.Minute)
+	ctx := context.Background()
+
+	_, err := client.GetSignatureKey(ctx, "missing")
+	if !errors.Is(err, ErrKeyNotFound) || err.Error() != `JWK is not found: "missing"` {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err = client.GetSignatureKey(ctx, "x\n2026/11/15 00:00:00 admin logged in\r\x1b[2J")
+	if !errors.Is(err, ErrKeyNotFound) || strings.ContainsAny(err.Error(), "\n\r\x1b") {
+		t.Fatalf("unexpected error: %q", err)
+	}
+
+	_, err = client.GetSignatureKey(ctx, strings.Repeat("\n", 1<<20))
+	if !errors.Is(err, ErrKeyNotFound) || len(err.Error()) > 300 || strings.Contains(err.Error(), "\n") {
+		t.Fatalf("unexpected error of %d bytes", len(err.Error()))
+	}
+
+	// the same when only the use does not match
+	_, err = client.GetEncryptionKey(ctx, "known")
+	if !errors.Is(err, ErrKeyNotFound) || err.Error() != `JWK is not found: "known", use: "enc"` {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQuoteUntrusted(t *testing.T) {
+	long := strings.Repeat("a", maxUntrustedLen)
+	for value, expected := range map[string]string{
+		"":         `""`,
+		"kid":      `"kid"`,
+		`a"b`:      `"a\"b"`,
+		"a\nb\rc":  `"a\nb\rc"`,
+		"\x1b[2J":  `"\x1b[2J"`,
+		"\xff":     `"\xff"`,
+		"a\u2028b": `"a\u2028b"`, // line separator
+		"a\u202eb": `"a\u202eb"`, // right-to-left override
+		long:       `"` + long + `"`,
+		long + "b": `"` + long + `"...`,
+		// a character is not cut in half
+		long[1:] + "\u00e9":       `"` + long[1:] + `"...`,
+		long[2:] + "\u00e9" + "b": `"` + long[2:] + "\u00e9" + `"...`,
+		// and invalid UTF-8 does not make the cut run away
+		strings.Repeat("\x80", maxUntrustedLen+1): `"` + strings.Repeat(`\x80`, maxUntrustedLen-3) + `"...`,
+	} {
+		if quoted := quoteUntrusted(value); quoted != expected {
+			t.Errorf("quoteUntrusted(%q) = %s, expected %s", value, quoted, expected)
+		}
+	}
 }

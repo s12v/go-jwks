@@ -121,6 +121,9 @@ It is given up on after 15 seconds, even if the source ignores its context.
 ### Errors
 
 When there is no key with the requested id and use, the error wraps `jwks.ErrKeyNotFound` (check with `errors.Is`).
+The key id is cut to 100 bytes and quoted in the message, so that an id from a hostile token
+cannot forge log lines or flood the log. Quoting escapes control and non-printable characters,
+so the quoted id can be longer than 100 bytes.
 Any other error means that the key set could not be loaded, or that the caller's context is done.
 
 ### Cache implementations
@@ -151,8 +154,13 @@ type JWKSSource interface {
 ```
 
 `WebSource` skips the keys it cannot parse (an unknown key type or curve, missing parameters and so on),
-so that one such key does not make the rest of the key set unavailable. Skipped keys are logged.
+so that one such key does not make the rest of the key set unavailable. Skipped keys are logged
+(the first five of them by name).
 If no key can be parsed, the request fails.
+
+A response larger than 1 MiB (`MaxResponseSize`) is rejected without being read in full.
+The limit applies to the response after decompression. It cannot be changed; if your key set is larger,
+provide your own source.
 
 ## Logging
 
@@ -161,4 +169,9 @@ Provide your own logger (anything with a `Printf(format string, v ...interface{}
 
 ```go
 jwks.SetLogger(myLogger)
+jwks.SetLogger(nil)           // no logging
+jwks.SetLogger(log.Default()) // back to the default
 ```
+
+The logger is shared by all clients and sources. `SetLogger` can be called at any time.
+A logger that panics does not take the client down; its messages are lost.
