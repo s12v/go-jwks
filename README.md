@@ -21,7 +21,8 @@ Requires Go 1.24 or newer.
 
 ## Example
 
-`GetSignatureKey` returns `*jose.JSONWebKey` for a given key id:
+`GetSignatureKey` returns `*jose.JSONWebKey` for a given key id. The id comes from the header of the token
+you are about to verify:
 
 ```go
 package main
@@ -29,29 +30,52 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/s12v/go-jwks"
 )
 
-func main() {
-	jwksSource := jwks.NewWebSource("https://www.googleapis.com/oauth2/v3/certs", nil)
-	jwksClient := jwks.NewDefaultClient(
-		jwksSource,
-		time.Hour,    // Refresh keys every 1 hour
-		12*time.Hour, // Expire keys after 12 hours
-	)
+// Create the client once and share it: it caches the keys.
+var jwksClient = jwks.NewDefaultClient(
+	jwks.NewWebSource("https://www.googleapis.com/oauth2/v3/certs", nil),
+	time.Hour,    // Refresh keys every 1 hour
+	12*time.Hour, // Expire keys after 12 hours
+)
 
-	var jwk *jose.JSONWebKey
-	jwk, err := jwksClient.GetSignatureKey(context.Background(), "c6af7caa0895fd01e778dceaa7a7988347d8f25c")
+// verify checks the signature of a token and returns its payload.
+func verify(ctx context.Context, token string) ([]byte, error) {
+	// Allow the algorithms you expect, not whatever the token asks for.
+	signed, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{jose.RS256})
+	if err != nil {
+		return nil, err
+	}
+
+	// The header of the token names the key it is signed with.
+	jwk, err := jwksClient.GetSignatureKey(ctx, signed.Signatures[0].Header.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("key: %v, alg: %v, use: %v", jwk.KeyID, jwk.Algorithm, jwk.Use)
+
+	return signed.Verify(jwk)
+}
+
+func main() {
+	// e.g. a Google ID token
+	payload, err := verify(context.Background(), os.Args[1])
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("key: %v, alg: %v, use: %v", jwk.KeyID, jwk.Algorithm, jwk.Use)
+	// The signature is valid. The claims in the payload (issuer, audience,
+	// expiry) are still yours to check.
+	log.Printf("payload: %s", payload)
 }
 ```
+
+A complete example that runs without a network is in [`example_test.go`](example_test.go).
 
 `NewWebSource` accepts an optional `*http.Client`; when `nil` is passed, a client with a 10 second timeout is used.
 
