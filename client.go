@@ -2,6 +2,7 @@ package jwks
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"slices"
@@ -156,21 +157,31 @@ func (c *jWKSClient) GetEncryptionKey(ctx context.Context, keyId string) (*jose.
 //
 // If there is no such key, the error wraps ErrKeyNotFound.
 //
-// The returned JSONWebKey is the caller's own: changing its fields does not
-// affect the key that other callers get. What it refers to (the key in Key,
-// the certificates) is shared and must not be modified.
+// The returned JSONWebKey is the caller's own: changing its fields, or the
+// contents of its slices, does not affect the key that other callers get.
+// What it points to is shared and must not be modified: an RSA or EC key in
+// Key, the certificates in Certificates, and CertificatesURL.
 func (c *jWKSClient) GetKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {
-	jwk, err := c.getKey(ctx, keyId, use)
+	cached, err := c.getKey(ctx, keyId, use)
 	if err != nil {
 		return nil, err
 	}
 	// The key lives in the cache and is handed to every caller: give each
 	// one a copy, so that none of them can change it for the others.
-	own := *jwk
-	own.Certificates = slices.Clone(jwk.Certificates)
-	own.CertificateThumbprintSHA1 = slices.Clone(jwk.CertificateThumbprintSHA1)
-	own.CertificateThumbprintSHA256 = slices.Clone(jwk.CertificateThumbprintSHA256)
-	return &own, nil
+	key := *cached
+	key.Certificates = slices.Clone(cached.Certificates)
+	key.CertificateThumbprintSHA1 = slices.Clone(cached.CertificateThumbprintSHA1)
+	key.CertificateThumbprintSHA256 = slices.Clone(cached.CertificateThumbprintSHA256)
+	// some keys are slices themselves
+	switch material := cached.Key.(type) {
+	case ed25519.PublicKey:
+		key.Key = slices.Clone(material)
+	case ed25519.PrivateKey:
+		key.Key = slices.Clone(material)
+	case []byte:
+		key.Key = slices.Clone(material)
+	}
+	return &key, nil
 }
 
 func (c *jWKSClient) getKey(ctx context.Context, keyId string, use string) (*jose.JSONWebKey, error) {

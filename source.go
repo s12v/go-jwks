@@ -26,6 +26,9 @@ const MaxResponseSize = 1 << 20
 // maxSkippedReported is how many skipped keys are named in the log.
 const maxSkippedReported = 5
 
+// JWKSSource provides the key set. The client serves the keys it returns as
+// they are: a source that takes the key set from somewhere it does not
+// control should leave out the keys that are not public, like WebSource does.
 type JWKSSource interface {
 	JSONWebKeySet(ctx context.Context) (*jose.JSONWebKeySet, error)
 }
@@ -131,8 +134,13 @@ func parseKeys(rawKeys []json.RawMessage) (*jose.JSONWebKeySet, []error) {
 	return keySet, skipped
 }
 
-// errNotPublicKey is why a private or a symmetric key is skipped.
-var errNotPublicKey = errors.New("not a public key")
+// errNotPublicKey is why a key with private or symmetric key material is
+// skipped.
+var errNotPublicKey = errors.New("not a public key: it holds private or symmetric key material, which must not be published")
+
+// privateMembers are the members of a JWK that hold private or symmetric key
+// material (RFC 7518, section 6, and the "priv" of an ML-DSA key).
+var privateMembers = []string{"k", "d", "p", "q", "dp", "dq", "qi", "oth", "priv"}
 
 func parseKey(rawKey json.RawMessage) (jose.JSONWebKey, error) {
 	var key jose.JSONWebKey
@@ -143,10 +151,28 @@ func parseKey(rawKey json.RawMessage) (jose.JSONWebKey, error) {
 	// for them, and both take a public key. A private or a symmetric key
 	// that is published in a key set is no secret any more, so anyone can
 	// sign with it: it must not be used to verify anything.
-	if !key.IsPublic() {
+	//
+	// The type of the parsed key does not tell the whole story: an RSA key
+	// that comes with its prime factors but without "d" is parsed as a
+	// public key, and is just as compromised.
+	if !key.IsPublic() || hasPrivateMembers(rawKey) {
 		return key, errNotPublicKey
 	}
 	return key, nil
+}
+
+func hasPrivateMembers(rawKey json.RawMessage) bool {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(rawKey, &members); err != nil {
+		// not an object; it would not have been parsed as a key either
+		return true
+	}
+	for _, name := range privateMembers {
+		if _, found := members[name]; found {
+			return true
+		}
+	}
+	return false
 }
 
 // skippedReport returns what to log about the keys that were skipped. It is

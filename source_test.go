@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,15 +334,33 @@ func marshalKey(t *testing.T, keyId string, key interface{}) string {
 	return string(data)
 }
 
+var (
+	generateRSAKey  sync.Once
+	generatedRSAKey *rsa.PrivateKey
+)
+
+// testRSAPrivateKey returns an RSA key that is generated once: it takes a
+// while, the more so under the race detector.
+func testRSAPrivateKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	generateRSAKey.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generatedRSAKey = key
+	})
+	if generatedRSAKey == nil {
+		t.Fatal("no RSA key")
+	}
+	return generatedRSAKey
+}
+
 // testKeyPairs returns a private and a public key of each supported type,
 // and a symmetric key, by key id.
 func testKeyPairs(t *testing.T) (private map[string]string, public map[string]string) {
 	t.Helper()
-	// the size does not matter here, and a small key is quick to generate
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rsaKey := testRSAPrivateKey(t)
 	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -350,8 +369,36 @@ func testKeyPairs(t *testing.T) (private map[string]string, public map[string]st
 	if err != nil {
 		t.Fatal(err)
 	}
+	// an RSA key without "d" is parsed as a public key, whatever else of
+	// the private key comes with it
+	withMembers := func(keyId string, members ...string) string {
+		var all, kept map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(marshalKey(t, keyId, rsaKey)), &all); err != nil {
+			t.Fatal(err)
+		}
+		kept = map[string]json.RawMessage{}
+		for _, name := range append([]string{"kty", "kid", "use", "n", "e"}, members...) {
+			if _, found := all[name]; !found {
+				t.Fatalf("no %q in the RSA key", name)
+			}
+			kept[name] = all[name]
+		}
+		data, err := json.Marshal(kept)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
 	private = map[string]string{
 		"rsa-private": marshalKey(t, "rsa-private", rsaKey),
+		"rsa-factors": withMembers("rsa-factors", "p", "q"),
+		"rsa-p":       withMembers("rsa-p", "p"),
+		"rsa-q":       withMembers("rsa-q", "q"),
+		"rsa-dp":      withMembers("rsa-dp", "dp"),
+		"rsa-dq":      withMembers("rsa-dq", "dq"),
+		"rsa-qi":      withMembers("rsa-qi", "qi"),
+		"rsa-oth":     strings.Replace(marshalKey(t, "rsa-oth", &rsaKey.PublicKey), `{`, `{"oth":[],`, 1),
+		"rsa-k":       strings.Replace(marshalKey(t, "rsa-k", &rsaKey.PublicKey), `{`, `{"k":"c2VjcmV0",`, 1),
 		"ec-private":  marshalKey(t, "ec-private", ecKey),
 		"ed-private":  marshalKey(t, "ed-private", edPrivate),
 		"symmetric":   marshalKey(t, "symmetric", []byte("a secret that is not one any more")),
